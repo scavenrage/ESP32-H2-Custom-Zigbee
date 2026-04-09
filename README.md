@@ -2,7 +2,7 @@
 
 A family of Zigbee-based controllers built around the **ESP32-H2**, designed for lighting automation, shutter/blind control, switch retrofitting, and LED dimming. Multiple PCB variants are available to fit different installation scenarios. All devices operate as **Zigbee routers** and support **Zigbee OTA firmware updates**.
 
-**PCB designs:** https://oshwlab.com/scavenrage/wedo-4-zigbee-pro
+**PCB designs:**  https://oshwlab.com/scavenrage/project_oyjbpylj
 
 ---
 
