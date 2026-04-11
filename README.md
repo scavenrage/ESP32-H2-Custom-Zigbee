@@ -102,7 +102,7 @@ The **BOOT button (GPIO 9)** doubles as a Zigbee factory reset trigger at any ti
 **Notes:**
 - Releasing the button before the 5 s window cancels the reset and returns the LED to its previous state.
 - The NVS configuration (channel types, timings, etc.) is **not** affected — only the Zigbee network credentials are erased.
-- The first 10 s after power-up are ignored to avoid false triggers caused by the USB-serial adapter holding GPIO 9 low during flash/monitor sessions.
+- The first 10 s after power-up are ignored to avoid false triggers at boot.
 
 ---
 
@@ -164,14 +164,14 @@ Output files (generated in the same folder as `configure.py`):
 Use this method if you do **not** need to build from source.
 
 ```cmd
-esptool.py --chip esp32h2 --port COM3 --baud 460800 write_flash --flash_mode dio --flash_freq 48m --flash_size 4MB 0x0000 binaries/bootloader.bin 0x8000 binaries/partition-table.bin 0x9000 nvs_config.bin 0x10000 binaries/ota_data_initial.bin 0x20000 binaries/smart_switch.bin
+esptool.py --chip esp32h2 --port COM12 --baud 460800 write_flash --flash_mode dio --flash_freq 48m --flash_size 4MB 0x0000 binaries/bootloader.bin 0x8000 binaries/partition-table.bin 0x9000 nvs_config.bin 0x10000 binaries/ota_data_initial.bin 0x20000 binaries/smart_switch.bin
 ```
 
-Replace `COM3` with your actual port (`/dev/ttyUSBx` on Linux/macOS).  
+Replace `COM12` with your actual port (`/dev/ttyUSBx` on Linux/macOS).  
 Flash `nvs_config.bin` alone to update the configuration without touching the firmware:
 
 ```cmd
-esptool.py --port COM3 write_flash 0x9000 nvs_config.bin
+esptool.py --port COM12 write_flash 0x9000 nvs_config.bin
 ```
 
 ---
@@ -185,7 +185,7 @@ cd smart_switch
 idf.py set-target esp32h2
 idf.py build
 idf.py flash
-esptool.py --port COM3 write_flash 0x9000 nvs_config.bin
+esptool.py --port COM12 write_flash 0x9000 nvs_config.bin
 ```
 
 > `idf.py flash` writes the firmware to the OTA slot (`0x20000`) but does **not** touch the NVS partition, so `nvs_config.bin` must be flashed separately.
