@@ -69,8 +69,23 @@ Each output channel is independently configured via `configure.py`:
 | Output | GPIO 4 | GPIO 5 | GPIO 10 | GPIO 11 |
 | Input  | GPIO 1 | GPIO 0 | GPIO 3  | GPIO 2  |
 
-Status LED: **GPIO 22**  
+Status LED: **GPIO 22** *(PCB A and B only — not present on PCB C)*  
 Factory Reset: **GPIO 9** (BOOT button — hold 5 s)
+
+---
+
+## Status LED
+
+> The status LED (GPIO 22) is present on **PCB A (4-channel relay)** and **PCB B (single relay)** only. PCB C (MOSFET/dimmer) does not have an onboard LED.
+
+| Pattern | Meaning |
+|---------|---------|
+| Fast blink (100 ms) | Booting |
+| Double blink every 2 s | Searching for Zigbee network |
+| Single blink every 5 s | Operational (heartbeat) |
+| Slow blink (500 ms on/off) | OTA firmware download in progress |
+| 3 fast blinks every 3 s | Error |
+| Solid on | Factory reset countdown in progress |
 
 ---
 
