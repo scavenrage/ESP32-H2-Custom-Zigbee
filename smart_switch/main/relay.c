@@ -254,8 +254,8 @@ void relay_init(relay_change_cb_t cb)
         }
     }
 
-    xTaskCreate(input_task, "relay_input", 2048, NULL, 5, NULL);
-    xTaskCreate(nvs_task,   "relay_nvs",   1024, NULL, 2, NULL);
+    xTaskCreate(input_task, "relay_input", 4096, NULL, 5, NULL);
+    xTaskCreate(nvs_task,   "relay_nvs",   2048, NULL, 2, NULL);
 }
 
 /*

@@ -35,6 +35,7 @@
 #include "esp_zigbee_ota.h"
 #include "ha/esp_zigbee_ha_standard.h"
 #include "zdo/esp_zigbee_zdo_command.h"
+#include "esp_partition.h"
 #include <inttypes.h>
 #include <string.h>
 
@@ -94,36 +95,44 @@ static void ota_find_server(void)
 /* ── Callback hardware → Zigbee ──────────────────────────────────────── */
 
 /*
- * Contesti:
- *   1. Task esterno (input_task, button_task): usare esp_zb_lock_acquire/release
- *   2. Task Zigbee (signal handler, tramite scheduler_alarm): lock già tenuto
+ * IMPORTANTE: il firmware rollershutter (che funziona perfettamente) NON usa
+ * MAI esp_zb_lock_acquire. Usa SOLO esp_zb_scheduler_alarm per tutte le
+ * comunicazioni verso lo stack Zigbee. Mischiare esp_zb_lock_acquire (mutex)
+ * con esp_zb_scheduler_alarm (coda) da task diversi causa race condition
+ * sul QueueSet interno dello stack Zigbee → crash in prvNotifyQueueSetContainer.
  *
- * on_relay_changed è chiamato sia da input_task (contesto esterno) sia dal
- * timer daemon (relay a impulso). In entrambi i casi siamo fuori dal task Zigbee,
- * quindi acquisire il lock è corretto.
+ * Tutte le callback hardware usano quindi esp_zb_scheduler_alarm.
  */
-static void on_relay_changed(uint8_t ch, bool state)
+
+/* ── Relay → Zigbee (via scheduler_alarm) ──────────────────────────── */
+/* Codifica parametro: bit7=stato, bit0..6=canale */
+static void do_relay_zigbee_sync(uint8_t param)
 {
+    uint8_t ch  = param & 0x7F;
+    uint8_t val = (param & 0x80) ? 1 : 0;
     if (!zigbee_ready) return;
-    uint8_t ep  = s_ch_to_ep[ch];
-    uint8_t val = state ? 1 : 0;
-    esp_zb_lock_acquire(portMAX_DELAY);
+    uint8_t ep = s_ch_to_ep[ch];
     esp_zb_zcl_set_attribute_val(ep,
         ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
         &val, false);
-    esp_zb_lock_release();
 }
 
-/* Chiamata da shutter.c — può venire da input_task (lock) o da signal handler
- * tramite shutter_sync_all (già in task Zigbee, NON acquisire lock).
- * Per semplicità: shutter_sync_all viene chiamato tramite scheduler_alarm,
- * quindi siamo nel task Zigbee → lock non necessario. */
-static void on_shutter_changed(uint8_t ch, uint8_t pos)
+static void on_relay_changed(uint8_t ch, bool state)
 {
     if (!zigbee_ready) return;
-    uint8_t ep = s_ch_to_ep[ch];
+    uint8_t param = (ch & 0x7F) | (state ? 0x80 : 0x00);
+    esp_zb_scheduler_alarm(do_relay_zigbee_sync, param, 0);
+}
+
+/* ── Shutter → Zigbee (via scheduler_alarm) ────────────────────────── */
+static void do_shutter_zigbee_sync(uint8_t param)
+{
+    uint8_t ch = param;
+    if (!zigbee_ready) return;
+    uint8_t ep  = s_ch_to_ep[ch];
+    uint8_t pos = shutter_get_position(ch);
     esp_zb_zcl_set_attribute_val(ep,
         ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -131,13 +140,24 @@ static void on_shutter_changed(uint8_t ch, uint8_t pos)
         &pos, false);
 }
 
-/* Chiamata da dimmer.c (button_task) — task esterno: acquisire il lock */
-static void on_dimmer_changed(bool on_off, uint8_t level)
+static void on_shutter_changed(uint8_t ch, uint8_t pos)
 {
     if (!zigbee_ready) return;
+    esp_zb_scheduler_alarm(do_shutter_zigbee_sync, ch, 0);
+}
+
+/* ── Dimmer → Zigbee (via scheduler_alarm) ─────────────────────────── */
+/* Stato dimmer memorizzato qui per il callback asincrono */
+static volatile uint8_t s_dimmer_pending_level;
+static volatile bool    s_dimmer_pending_on;
+
+static void do_dimmer_zigbee_sync(uint8_t param)
+{
+    (void)param;
+    if (!zigbee_ready) return;
     uint8_t ep     = s_ch_to_ep[0];
-    uint8_t on_val = on_off ? 1 : 0;
-    esp_zb_lock_acquire(portMAX_DELAY);
+    uint8_t on_val = s_dimmer_pending_on ? 1 : 0;
+    uint8_t level  = s_dimmer_pending_level;
     esp_zb_zcl_set_attribute_val(ep,
         ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -148,7 +168,14 @@ static void on_dimmer_changed(bool on_off, uint8_t level)
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID,
         &level, false);
-    esp_zb_lock_release();
+}
+
+static void on_dimmer_changed(bool on_off, uint8_t level)
+{
+    if (!zigbee_ready) return;
+    s_dimmer_pending_on    = on_off;
+    s_dimmer_pending_level = level;
+    esp_zb_scheduler_alarm(do_dimmer_zigbee_sync, 0, 0);
 }
 
 /* ── Costruzione cluster Basic ───────────────────────────────────────── */
@@ -173,10 +200,10 @@ static void add_relay_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep, uint8_t ch
     esp_zb_cluster_list_add_basic_cluster(cl, create_basic_cluster(),
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    esp_zb_attribute_list_t *id_cl = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY);
-    uint8_t id_time = 0;
-    esp_zb_identify_cluster_add_attr(id_cl, ESP_ZB_ZCL_ATTR_IDENTIFY_IDENTIFY_TIME_ID, &id_time);
-    esp_zb_cluster_list_add_identify_cluster(cl, id_cl, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_identify_cluster_cfg_t id_cfg = { .identify_time = 0 };
+    esp_zb_cluster_list_add_identify_cluster(cl,
+        esp_zb_identify_cluster_create(&id_cfg),
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_on_off_cluster_cfg_t oo = { .on_off = 0 };
     esp_zb_cluster_list_add_on_off_cluster(cl,
@@ -434,7 +461,27 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
                      esp_zb_get_pan_id(),
                      esp_zb_get_short_address());
             led_set_state(LED_OPERATIONAL);
-            shutter_sync_all();
+            /* Sync stato relay e posizioni tapparelle — siamo nel task Zigbee, nessun lock */
+            for (int i = 0; i < 4; i++) {
+                uint8_t ep = s_ch_to_ep[i];
+                if (ep == 0) continue;
+                if (g_sw_cfg.ch_type[i] == CH_RELAY_STABLE ||
+                    g_sw_cfg.ch_type[i] == CH_RELAY_IMPULSE) {
+                    uint8_t val = relay_get((uint8_t)i) ? 1 : 0;
+                    esp_zb_zcl_set_attribute_val(ep,
+                        ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+                        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                        ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+                        &val, false);
+                } else if (g_sw_cfg.ch_type[i] == CH_SHUTTER) {
+                    uint8_t pos = shutter_get_position((uint8_t)i);
+                    esp_zb_zcl_set_attribute_val(ep,
+                        ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+                        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                        ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE_ID,
+                        &pos, false);
+                }
+            }
             ota_find_server();
         } else {
             ESP_LOGW(TAG, "Steering fallito, riprovo tra 5s...");
@@ -448,6 +495,84 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
         ESP_LOGI(TAG, "Segnale: %s (0x%x) %s",
                  esp_zb_zdo_signal_to_string(type), type, esp_err_to_name(err));
         break;
+    }
+}
+
+/* ── Factory reset Zigbee (pulsante BOOT / GPIO9) ───────────────────── */
+/*
+ * Un task dedicato monitora GPIO9 in continuazione. Se il pulsante viene
+ * tenuto premuto per FACTORY_RESET_HOLD_S secondi (in qualsiasi momento,
+ * non solo all'avvio), il firmware esegue esp_zb_factory_reset() e
+ * riavvia il dispositivo. La configurazione NVS resta intatta.
+ *
+ * Feedback LED: durante la pressione il LED passa a LED_FACTORY_RESET
+ * (acceso fisso). Se rilasci prima del tempo, torna allo stato precedente.
+ */
+#define FACTORY_RESET_GPIO       GPIO_NUM_9
+#define FACTORY_RESET_HOLD_S     5
+
+static void factory_reset_task(void *pv)
+{
+    gpio_config_t btn = {
+        .pin_bit_mask = (1ULL << FACTORY_RESET_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&btn);
+
+    /* Ignora i primi 10s: durante il boot il chip USB-seriale può tenere
+       DTR/RTS basso → GPIO9 risulta falsamente premuto */
+    vTaskDelay(pdMS_TO_TICKS(10000));
+
+    for (;;) {
+        /* Aspetta che GPIO9 venga premuto (attivo-basso) */
+        if (gpio_get_level(FACTORY_RESET_GPIO) != 0) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        /* Premuto — inizia conteggio */
+        ESP_LOGW(TAG, "GPIO9 premuto — tieni premuto %ds per factory reset Zigbee...",
+                 FACTORY_RESET_HOLD_S);
+        led_set_state(LED_FACTORY_RESET);
+
+        bool held = true;
+        for (int i = 0; i < FACTORY_RESET_HOLD_S * 10; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (gpio_get_level(FACTORY_RESET_GPIO) != 0) {
+                held = false;
+                break;
+            }
+        }
+
+        if (!held) {
+            ESP_LOGI(TAG, "GPIO9 rilasciato — annullato");
+            led_set_state(zigbee_ready ? LED_OPERATIONAL : LED_ZIGBEE_SEARCHING);
+            continue;
+        }
+
+        /* Tenuto abbastanza — cancella partizioni Zigbee e riavvia.
+         * Cancelliamo direttamente le partizioni flash zb_storage e zb_fct
+         * senza passare dallo stack Zigbee (che richiederebbe il suo task). */
+        ESP_LOGW(TAG, "*** FACTORY RESET ZIGBEE — cancello partizioni... ***");
+        const char *zb_parts[] = { "zb_storage", "zb_fct" };
+        for (int i = 0; i < 2; i++) {
+            const esp_partition_t *p = esp_partition_find_first(
+                ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, zb_parts[i]);
+            if (p) {
+                esp_err_t err = esp_partition_erase_range(p, 0, p->size);
+                ESP_LOGW(TAG, "Partizione '%s' (0x%"PRIx32", %"PRIu32" byte): %s",
+                         zb_parts[i], p->address, p->size,
+                         err == ESP_OK ? "CANCELLATA" : esp_err_to_name(err));
+            } else {
+                ESP_LOGE(TAG, "Partizione '%s' NON TROVATA!", zb_parts[i]);
+            }
+        }
+        ESP_LOGW(TAG, "Riavvio...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
     }
 }
 
@@ -490,6 +615,9 @@ void app_main(void)
 
     /* LED di stato */
     led_init();
+
+    /* Task monitor GPIO9 (BOOT) — factory reset Zigbee se premuto 5s */
+    xTaskCreate(factory_reset_task, "factory_rst", 2048, NULL, 1, NULL);
 
     /* ISR service GPIO — chiamato una volta sola */
     gpio_install_isr_service(0);

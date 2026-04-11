@@ -69,7 +69,25 @@ Each output channel is independently configured via `configure.py`:
 | Output | GPIO 4 | GPIO 5 | GPIO 10 | GPIO 11 |
 | Input  | GPIO 1 | GPIO 0 | GPIO 3  | GPIO 2  |
 
-Status LED: **GPIO 22**
+Status LED: **GPIO 22**  
+Factory Reset: **GPIO 9** (BOOT button — hold 5 s)
+
+---
+
+## Factory Reset
+
+The **BOOT button (GPIO 9)** doubles as a Zigbee factory reset trigger at any time after power-up.
+
+**How to use:**
+
+1. Hold the BOOT button for **5 seconds** — the status LED switches to solid white during the countdown.
+2. Release after 5 s — the device erases all Zigbee network data (`zb_storage` and `zb_fct` partitions) and reboots.
+3. After reboot, the device starts fresh network steering and can be added to a new Zigbee network (e.g. via ZHA → Add device).
+
+**Notes:**
+- Releasing the button before the 5 s window cancels the reset and returns the LED to its previous state.
+- The NVS configuration (channel types, timings, etc.) is **not** affected — only the Zigbee network credentials are erased.
+- The first 10 s after power-up are ignored to avoid false triggers caused by the USB-serial adapter holding GPIO 9 low during flash/monitor sessions.
 
 ---
 
@@ -205,3 +223,7 @@ Zigbee/
     ├── partitions.csv
     └── sdkconfig.defaults
 ```
+
+---
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.

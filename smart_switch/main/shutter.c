@@ -347,6 +347,9 @@ void shutter_init(shutter_change_cb_t cb)
 
     nvs_load();
 
+    /* Coda creata PRIMA di registrare gli ISR */
+    s_input_q = xQueueCreate(8, sizeof(sh_evt_t));
+
     for (int i = 0; i < s_num_sh; i++) {
         uint8_t p = s_active[i].phys;
 
@@ -394,7 +397,6 @@ void shutter_init(shutter_change_cb_t cb)
                  p==0?'A':'B', UP_GPIO[p], DOWN_GPIO[p], s_sh[p].position);
     }
 
-    s_input_q = xQueueCreate(8, sizeof(sh_evt_t));
-    xTaskCreate(input_task, "shutter_in",  2048, NULL, 5, NULL);
-    xTaskCreate(nvs_task,   "shutter_nvs", 1024, NULL, 2, NULL);
+    xTaskCreate(input_task, "shutter_in",  4096, NULL, 5, NULL);
+    xTaskCreate(nvs_task,   "shutter_nvs", 2048, NULL, 2, NULL);
 }
