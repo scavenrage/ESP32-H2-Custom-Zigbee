@@ -453,6 +453,14 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
         }
         break;
 
+    case ESP_ZB_ZDO_SIGNAL_LEAVE:
+        zigbee_ready = false;
+        ESP_LOGW(TAG, "Segnale LEAVE ricevuto — riprovo steering tra 5s...");
+        led_set_state(LED_ZIGBEE_SEARCHING);
+        esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
+                               ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
+        break;
+
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err == ESP_OK) {
             zigbee_ready = true;
@@ -495,6 +503,46 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
         ESP_LOGI(TAG, "Segnale: %s (0x%x) %s",
                  esp_zb_zdo_signal_to_string(type), type, esp_err_to_name(err));
         break;
+    }
+}
+
+/* ── Watchdog applicativo Zigbee ─────────────────────────────────────── */
+/*
+ * La callback zb_wdt_feed_cb viene schedulata ogni 60s dallo scheduler
+ * Zigbee. Se lo stack si blocca silenziosamente, la callback smette di
+ * essere chiamata. Il task zb_watchdog_task verifica ogni 30s che il feed
+ * sia arrivato; se manca da più di 3 minuti forza esp_restart().
+ *
+ * Tutto si avvia in esp_zb_task() dopo esp_zb_start(), quindi solo quando
+ * lo stack è già attivo.
+ */
+#define ZB_WDT_FEED_INTERVAL_MS   60000    /* feed ogni 60s                */
+#define ZB_WDT_TIMEOUT_MS         180000   /* reset se fermo > 3 min       */
+#define ZB_WDT_CHECK_INTERVAL_MS  30000    /* check ogni 30s               */
+
+static volatile TickType_t s_zb_last_feed = 0;
+
+static void zb_wdt_feed_cb(uint8_t param)
+{
+    (void)param;
+    s_zb_last_feed = xTaskGetTickCount();
+    esp_zb_scheduler_alarm(zb_wdt_feed_cb, 0, ZB_WDT_FEED_INTERVAL_MS);
+}
+
+static void zb_watchdog_task(void *pv)
+{
+    /* Aspetta che lo stack parta e il primo feed sia registrato */
+    vTaskDelay(pdMS_TO_TICKS(ZB_WDT_FEED_INTERVAL_MS + 30000));
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(ZB_WDT_CHECK_INTERVAL_MS));
+        TickType_t elapsed = xTaskGetTickCount() - s_zb_last_feed;
+        if (elapsed > pdMS_TO_TICKS(ZB_WDT_TIMEOUT_MS)) {
+            ESP_LOGE("ZB_WDT", "Stack Zigbee non risponde da %lu s — riavvio!",
+                     (unsigned long)(elapsed * portTICK_PERIOD_MS / 1000));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        }
     }
 }
 
@@ -590,6 +638,11 @@ static void esp_zb_task(void *pv)
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
 
     ESP_ERROR_CHECK(esp_zb_start(false));
+
+    /* Avvia il feed periodico del watchdog applicativo */
+    s_zb_last_feed = xTaskGetTickCount();
+    esp_zb_scheduler_alarm(zb_wdt_feed_cb, 0, ZB_WDT_FEED_INTERVAL_MS);
+
     esp_zb_stack_main_loop();
 }
 
@@ -618,6 +671,9 @@ void app_main(void)
 
     /* Task monitor GPIO9 (BOOT) — factory reset Zigbee se premuto 5s */
     xTaskCreate(factory_reset_task, "factory_rst", 2048, NULL, 1, NULL);
+
+    /* Task watchdog applicativo — riavvia se lo stack Zigbee si blocca */
+    xTaskCreate(zb_watchdog_task, "zb_wdt", 2048, NULL, 2, NULL);
 
     /* ISR service GPIO — chiamato una volta sola */
     gpio_install_isr_service(0);
