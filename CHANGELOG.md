@@ -6,9 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ## [v1.2.0]
 
-- **Fix:** Dispositivi che vanno offline senza crashare — aggiunta gestione del segnale `ESP_ZB_ZDO_SIGNAL_LEAVE`: il dispositivo ora ritenta automaticamente lo steering dopo 5 s invece di restare offline fino al prossimo riavvio fisico
-- **New:** Watchdog applicativo Zigbee — una callback schedulata ogni 60 s verifica che lo stack sia attivo; se non risponde per più di 3 minuti il firmware esegue `esp_restart()` in autonomia
-- **Fix:** Correzione numerazione versioni OTA — lo schema corretto è `0xMMNN00PP` (MM=major, NN=minor, PP=patch su 8 bit); il valore precedente `0x00010100` era malformato e produceva versioni senza senso
+- **Fix:** Device going offline without crashing — added handling for `ESP_ZB_ZDO_SIGNAL_LEAVE` signal: device now automatically retries network steering after 5 s instead of staying offline until power cycled
+- **New:** Application-level Zigbee watchdog — a scheduler alarm fires every 60 s to confirm the stack is alive; if no feed is received for more than 3 minutes, the firmware calls `esp_restart()` automatically
+- **Fix:** OTA version numbering corrected — scheme is now `0xMMNN00PP` (MM=major, NN=minor, PP=patch); previous value `0x00010100` was malformed and produced nonsensical version strings
 
 ## [v1.1.0]
 
