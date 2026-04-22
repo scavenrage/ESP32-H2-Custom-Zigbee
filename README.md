@@ -201,7 +201,9 @@ OTA updates replace the firmware without touching the NVS configuration.
 Edit `smart_switch/main/ota.h` and increment `OTA_FILE_VERSION`:
 
 ```c
-#define OTA_FILE_VERSION  2   // increment for each release
+/* Format: 0xMMNNPPPP — MM=major, NN=minor, PPPP=patch (16-bit) */
+#define OTA_FILE_VERSION  0x01030000   /* e.g. v1.3.0 */
+#define OTA_SW_BUILD_ID   "\x06""v1.3.0"
 ```
 
 **3b. Build and package the OTA image**

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v1.3.0]
+
+- **Fix:** Silent disconnection no longer requires manual power cycle — added handling for `ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT` (0x18): when the device loses all active network links without receiving an explicit LEAVE, it now sets itself to searching state and retries steering after 1 s. Previously the device believed it was still connected (LED remained operational) while ZHA reported it as unavailable
+- **Fix:** `ESP_ZB_NLME_STATUS_INDICATION` (0x32) and `ESP_ZB_ZDO_DEVICE_UNAVAILABLE` (0x3c) signals now handled explicitly — they were falling through to the default log handler and causing noisy output with no action taken
+- **Improvement:** Zigbee channel scan restricted to channel 25 only (`ESP_ZB_PRIMARY_CHANNEL_MASK = 1UL << 25`) — previously all 16 channels (11–26) were scanned on every steering attempt, significantly slowing down reconnection
+- **Improvement:** `IEEE802154_TIMING_OPTIMIZATION` enabled in `sdkconfig.defaults` — improves radio stability and OTA throughput as recommended by Espressif for ESP32-H2
+- **Improvement:** `FREERTOS_HZ` raised from 100 to 1000 in `sdkconfig.defaults` — improves task responsiveness, particularly during OTA transfers
+
 ## [v1.2.0]
 
 - **Fix:** Device going offline without crashing — added handling for `ESP_ZB_ZDO_SIGNAL_LEAVE` signal: device now automatically retries network steering after 5 s instead of staying offline until power cycled

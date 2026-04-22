@@ -44,7 +44,7 @@ static const char *TAG = "MAIN";
 /* ── Configurazione Zigbee ───────────────────────────────────────────── */
 #define INSTALLCODE_POLICY_ENABLE    false
 #define MAX_CHILDREN                 10
-#define ESP_ZB_PRIMARY_CHANNEL_MASK  ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
+#define ESP_ZB_PRIMARY_CHANNEL_MASK  (1UL << 25)   /* canale fisso 25 */
 #define OTA_UPGRADE_QUERY_INTERVAL   240   /* minuti */
 
 #define ESP_MANUFACTURER_NAME  "\x09""Handmade!"
@@ -497,6 +497,24 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
                                    ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
         }
+        break;
+
+    case ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
+        if (zigbee_ready) {   /* guard: evita scheduling multiplo */
+            zigbee_ready = false;
+            ESP_LOGW(TAG, "Nessun link attivo (0x18) — forzo riconnessione");
+            led_set_state(LED_ZIGBEE_SEARCHING);
+            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
+                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+        }
+        break;
+
+    case ESP_ZB_NLME_STATUS_INDICATION:
+        ESP_LOGD(TAG, "NLME Status Indication (0x32) — ignorato");
+        break;
+
+    case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
+        ESP_LOGD(TAG, "ZDO Device Unavailable (0x3c) — ignorato");
         break;
 
     default:

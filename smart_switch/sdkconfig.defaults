@@ -29,3 +29,11 @@ CONFIG_MBEDTLS_ECJPAKE_C=y
 #
 CONFIG_ZB_ENABLED=y
 CONFIG_ZB_ZCZR=y
+
+#
+# Prestazioni radio e sistema
+# IEEE802154_TIMING_OPTIMIZATION: migliora stabilità radio e throughput OTA
+# FREERTOS_HZ=1000: migliora responsività task (default 100, consigliato 1000 da Espressif per Zigbee)
+#
+CONFIG_IEEE802154_TIMING_OPTIMIZATION=y
+CONFIG_FREERTOS_HZ=1000
