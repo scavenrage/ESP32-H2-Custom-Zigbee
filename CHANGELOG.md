@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v1.5.0]
+
+- **Fix:** ZDO keepalive callback never invoked on route error — when the NWK layer returns a route error (instead of waiting for a ZDP timeout), `coordinator_ping_result` was never called, leaving the device permanently stuck in double-blink with no further alarms scheduled. Added a 40 s safety timeout (`coordinator_ping_timeout_cb`): if the callback does not arrive within 40 seconds, failure is forced manually
+- **New:** Automatic restart after consecutive ZDO failures — if the coordinator is unreachable for 6 consecutive cycles (≈ 4–5 minutes), the device calls `esp_restart()`. A reboot clears the neighbor table and routing table, the only reliable recovery from corrupted routing state that `bdb_start_top_level_commissioning(NETWORK_STEERING)` cannot fix (routing table is not cleared on an already-associated device)
+- **Improvement:** Periodic attribute reporting — on every successful ZDO ping (every 5 minutes) the firmware sends current relay states and shutter positions with `report=true`. This keeps ZHA updated even when no physical events occur, and stimulates route discovery from the device side to keep routes alive
+
+## [v1.4.0]
+
+- **New:** Coordinator keepalive / island detection — every 5 minutes the device sends a ZDO `ieee_addr_req` to the coordinator (0x0000). If 2 consecutive requests time out (`ESP_ZB_ZDP_STATUS_TIMEOUT`), the path to the coordinator is considered broken and network steering is triggered immediately without restarting. This fixes the silent "island" scenario where two routers maintain a link with each other but have no route to the coordinator — a condition that `NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT` never catches because at least one active neighbor still exists
+
 ## [v1.3.0]
 
 - **Fix:** Silent disconnection no longer requires manual power cycle — added handling for `ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT` (0x18): when the device loses all active network links without receiving an explicit LEAVE, it now sets itself to searching state and retries steering after 1 s. Previously the device believed it was still connected (LED remained operational) while ZHA reported it as unavailable

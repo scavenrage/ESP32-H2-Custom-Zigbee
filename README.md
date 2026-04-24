@@ -122,6 +122,14 @@ NVS configuration survives firmware OTA updates. Re-running `configure.py` and r
 - **Window Covering cluster (0x0102)** for roller shutter channels
 - **OTA Upgrade cluster (0x0019)** for wireless firmware updates
 
+### Connection resilience
+
+- **Coordinator keepalive** — a ZDO `ieee_addr_req` is sent to the coordinator every 5 minutes to confirm the path is alive, detecting "island" scenarios where the device is connected to other routers but has no route to the coordinator
+- **ZDO timeout guard** — if the keepalive callback is never invoked (e.g. NWK route error instead of ZDP timeout), a 40 s safety alarm forces failure detection
+- **Periodic attribute reporting** — on every successful keepalive, relay states and shutter positions are reported to ZHA with `report=true`, keeping routes active and ZHA updated
+- **Auto-restart after repeated failures** — after 6 consecutive unreachable responses (≈ 4–5 min), the device restarts to clear stale routing/neighbor tables, the only reliable recovery from corrupted NWK state
+- **Application-level Zigbee watchdog** — if the Zigbee stack stops responding for more than 3 minutes, `esp_restart()` is called automatically
+
 ---
 
 ## Getting Started
@@ -202,8 +210,8 @@ Edit `smart_switch/main/ota.h` and increment `OTA_FILE_VERSION`:
 
 ```c
 /* Format: 0xMMNNPPPP — MM=major, NN=minor, PPPP=patch (16-bit) */
-#define OTA_FILE_VERSION  0x01030000   /* e.g. v1.3.0 */
-#define OTA_SW_BUILD_ID   "\x06""v1.3.0"
+#define OTA_FILE_VERSION  0x01050000   /* e.g. v1.5.0 */
+#define OTA_SW_BUILD_ID   "\x06""v1.5.0"
 ```
 
 **3b. Build and package the OTA image**

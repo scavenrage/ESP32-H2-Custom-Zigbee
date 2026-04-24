@@ -64,7 +64,33 @@ static uint8_t s_ep_to_type[5];
 static uint8_t s_ch_to_ep[4];    /* ch 0..3 → ep */
 static uint8_t s_ota_ep = 1;
 
-static bool zigbee_ready = false;
+static bool zigbee_ready           = false;
+static bool s_coordinator_confirmed = false;   /* true solo dopo ping ZDO riuscito */
+static uint8_t s_ping_tick          = 0;
+static uint8_t s_ping_fail_count    = 0;       /* fallimenti ZDO consecutivi       */
+static bool    s_ping_in_flight     = false;   /* ping inviato, attesa callback    */
+
+/* ── Keepalive: costanti e forward declaration ───────────────────────── */
+/*
+ * esp_zb_scheduler_alarm tronca il delay a 16 bit internamente:
+ * valori > 65535 ms vanno in overflow. Usiamo 60000 ms (sicuro, stesso valore
+ * del watchdog) e contiamo COORDINATOR_PING_TICKS tick prima di ogni ping reale
+ * → intervallo effettivo = 60000 × 5 = 5 minuti.
+ *
+ * Se il coordinator non risponde per COORDINATOR_PING_MAX_FAILS cicli
+ * consecutivi (≈ 4-5 min), il dispositivo si riavvia per ripristinare
+ * da zero neighbor/routing table — l'unico modo affidabile per uscire
+ * da uno stato di routing corrotto senza intervento manuale.
+ *
+ * COORDINATOR_PING_TIMEOUT_MS: timeout di sicurezza per il caso in cui
+ * la callback ZDO non venga mai chiamata (route error anziché ZDP timeout).
+ */
+#define COORDINATOR_PING_TICK_MS       60000    /* intervallo sicuro per scheduler  */
+#define COORDINATOR_PING_TICKS         5        /* 5 × 60s = 5 min tra i ping       */
+#define COORDINATOR_PING_MAX_FAILS     6        /* restart dopo 6 fail × ~45s ≈ 4-5 min */
+#define COORDINATOR_PING_TIMEOUT_MS    40000    /* timeout se callback non arriva   */
+static void coordinator_ping_cb(uint8_t param);         /* definita più in basso */
+static void coordinator_ping_timeout_cb(uint8_t param); /* definita più in basso */
 
 static void init_ep_map(void)
 {
@@ -454,54 +480,36 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
         break;
 
     case ESP_ZB_ZDO_SIGNAL_LEAVE:
-        zigbee_ready = false;
-        ESP_LOGW(TAG, "Segnale LEAVE ricevuto — riprovo steering tra 5s...");
+        zigbee_ready            = false;
+        s_coordinator_confirmed = false;
+        ESP_LOGW(TAG, "Segnale LEAVE ricevuto — riprovo steering tra 30s...");
         led_set_state(LED_ZIGBEE_SEARCHING);
         esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
-                               ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
+                               ESP_ZB_BDB_MODE_NETWORK_STEERING, 30000);
         break;
 
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err == ESP_OK) {
             zigbee_ready = true;
-            ESP_LOGI(TAG, "Connesso: canale %d, PAN 0x%04hx, addr 0x%04hx",
+            ESP_LOGI(TAG, "Rete trovata: canale %d, PAN 0x%04hx, addr 0x%04hx — verifico coordinator...",
                      esp_zb_get_current_channel(),
                      esp_zb_get_pan_id(),
                      esp_zb_get_short_address());
-            led_set_state(LED_OPERATIONAL);
-            /* Sync stato relay e posizioni tapparelle — siamo nel task Zigbee, nessun lock */
-            for (int i = 0; i < 4; i++) {
-                uint8_t ep = s_ch_to_ep[i];
-                if (ep == 0) continue;
-                if (g_sw_cfg.ch_type[i] == CH_RELAY_STABLE ||
-                    g_sw_cfg.ch_type[i] == CH_RELAY_IMPULSE) {
-                    uint8_t val = relay_get((uint8_t)i) ? 1 : 0;
-                    esp_zb_zcl_set_attribute_val(ep,
-                        ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
-                        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                        ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
-                        &val, false);
-                } else if (g_sw_cfg.ch_type[i] == CH_SHUTTER) {
-                    uint8_t pos = shutter_get_position((uint8_t)i);
-                    esp_zb_zcl_set_attribute_val(ep,
-                        ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
-                        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                        ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE_ID,
-                        &pos, false);
-                }
-            }
-            ota_find_server();
+            /* LED rimane in SEARCHING: diventa operativo solo dopo che il ping ZDO
+             * al coordinator ha avuto risposta (in coordinator_ping_result). */
+            s_ping_tick = COORDINATOR_PING_TICKS - 1;   /* prossimo tick → ping subito */
+            esp_zb_scheduler_alarm(coordinator_ping_cb, 0, 1000);
         } else {
-            ESP_LOGW(TAG, "Steering fallito, riprovo tra 5s...");
-            led_set_state(LED_ZIGBEE_SEARCHING);
+            ESP_LOGW(TAG, "Steering fallito, riprovo tra 30s...");
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
-                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
+                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 30000);
         }
         break;
 
     case ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
         if (zigbee_ready) {   /* guard: evita scheduling multiplo */
-            zigbee_ready = false;
+            zigbee_ready            = false;
+            s_coordinator_confirmed = false;
             ESP_LOGW(TAG, "Nessun link attivo (0x18) — forzo riconnessione");
             led_set_state(LED_ZIGBEE_SEARCHING);
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
@@ -522,6 +530,127 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
                  esp_zb_zdo_signal_to_string(type), type, esp_err_to_name(err));
         break;
     }
+}
+
+/* ── Keepalive ZDO verso il coordinator (island detection) ──────────── */
+/*
+ * Ogni 5 minuti (5 tick × COORDINATOR_PING_TICK_MS) il dispositivo invia un ZDO
+ * ieee_addr_req al coordinator (0x0000).
+ *
+ * - Se risponde: la prima volta imposta LED operativo, sync stati, OTA.
+ *   Le volte successive è solo un keepalive silenzioso.
+ * - Se non risponde: zigbee_ready = false, LED searching, steering tra 30s.
+ *   Dopo lo steering, il ping riparte subito (1s) per verificare se il
+ *   coordinator è davvero raggiungibile prima di tornare operativo.
+ *
+ * Tutto gira nel task Zigbee tramite scheduler_alarm → nessun lock necessario.
+ */
+static void coordinator_ping_result(esp_zb_zdp_status_t zdo_status,
+                                    esp_zb_zdo_ieee_addr_rsp_t *resp,
+                                    void *user_ctx)
+{
+    s_ping_in_flight = false;   /* callback ricevuta (o timeout forzato) */
+    if (!zigbee_ready) return;
+
+    if (zdo_status == ESP_ZB_ZDP_STATUS_SUCCESS) {
+        s_ping_tick       = 0;
+        s_ping_fail_count = 0;
+        ESP_LOGD(TAG, "Keepalive coordinator: OK");
+
+        if (!s_coordinator_confirmed) {
+            /* Prima conferma dopo un (re)join: diventiamo operativi */
+            s_coordinator_confirmed = true;
+            ESP_LOGI(TAG, "Coordinator raggiungibile — operativo");
+            led_set_state(LED_OPERATIONAL);
+            ota_find_server();
+        }
+
+        /* Sync attributi con report=true: aggiorna ZHA e stimola route discovery.
+         * Eseguito ad ogni ping riuscito (non solo al primo join) per mantenere
+         * le route attive e il coordinator aggiornato sullo stato reale. */
+        for (int i = 0; i < 4; i++) {
+            uint8_t ep = s_ch_to_ep[i];
+            if (ep == 0) continue;
+            if (g_sw_cfg.ch_type[i] == CH_RELAY_STABLE ||
+                g_sw_cfg.ch_type[i] == CH_RELAY_IMPULSE) {
+                uint8_t val = relay_get((uint8_t)i) ? 1 : 0;
+                esp_zb_zcl_set_attribute_val(ep,
+                    ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                    ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+                    &val, true);
+            } else if (g_sw_cfg.ch_type[i] == CH_SHUTTER) {
+                uint8_t pos = shutter_get_position((uint8_t)i);
+                esp_zb_zcl_set_attribute_val(ep,
+                    ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING,
+                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                    ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE_ID,
+                    &pos, true);
+            }
+        }
+
+        /* Prossimo keepalive tra 5 minuti */
+        esp_zb_scheduler_alarm(coordinator_ping_cb, 0, COORDINATOR_PING_TICK_MS);
+    } else {
+        /* Coordinator non raggiungibile */
+        s_ping_fail_count++;
+        ESP_LOGW(TAG, "Coordinator irraggiungibile (0x%02x) — fail %d/%d",
+                 zdo_status, s_ping_fail_count, COORDINATOR_PING_MAX_FAILS);
+        zigbee_ready            = false;
+        s_coordinator_confirmed = false;
+        s_ping_tick             = 0;
+        led_set_state(LED_ZIGBEE_SEARCHING);
+
+        if (s_ping_fail_count >= COORDINATOR_PING_MAX_FAILS) {
+            /* Routing table/neighbor table probabilmente corrotti:
+             * l'unico recovery affidabile è un riavvio completo. */
+            ESP_LOGW(TAG, "Troppi fallimenti consecutivi — riavvio forzato");
+            esp_restart();
+        }
+
+        esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
+                               ESP_ZB_BDB_MODE_NETWORK_STEERING, 30000);
+    }
+}
+
+/* Timeout di sicurezza: se la callback ZDO non arriva entro COORDINATOR_PING_TIMEOUT_MS
+ * (es. route error anziché ZDP timeout), forziamo il fallimento noi stessi.
+ * Senza questo, il dispositivo resterebbe bloccato in s_coordinator_confirmed=false
+ * con nessun altro allarme schedulato — doppio lampeggio fisso per sempre. */
+static void coordinator_ping_timeout_cb(uint8_t param)
+{
+    (void)param;
+    if (!s_ping_in_flight) return;   /* callback già ricevuta normalmente */
+    ESP_LOGW(TAG, "Keepalive: nessuna risposta ZDO in %ds — forzo fallimento",
+             COORDINATOR_PING_TIMEOUT_MS / 1000);
+    coordinator_ping_result(ESP_ZB_ZDP_STATUS_TIMEOUT, NULL, NULL);
+}
+
+static void coordinator_ping_cb(uint8_t param)
+{
+    (void)param;
+    if (!zigbee_ready) return;
+
+    s_ping_tick++;
+    if (s_ping_tick < COORDINATOR_PING_TICKS) {
+        /* Non ancora il momento del ping: aspetta il prossimo tick */
+        esp_zb_scheduler_alarm(coordinator_ping_cb, 0, COORDINATOR_PING_TICK_MS);
+        return;
+    }
+    s_ping_tick = 0;
+
+    esp_zb_zdo_ieee_addr_req_param_t req = {
+        .dst_nwk_addr     = 0x0000,
+        .addr_of_interest = 0x0000,
+        .request_type     = 0,
+        .start_index      = 0,
+    };
+    ESP_LOGD(TAG, "Keepalive: ZDO ieee_addr_req → coordinator");
+    s_ping_in_flight = true;
+    esp_zb_zdo_ieee_addr_req(&req, coordinator_ping_result, NULL);
+    /* Timeout di sicurezza: se route error (non ZDP timeout), la callback
+     * non viene mai chiamata. L'allarme la simula dopo 40s. */
+    esp_zb_scheduler_alarm(coordinator_ping_timeout_cb, 0, COORDINATOR_PING_TIMEOUT_MS);
 }
 
 /* ── Watchdog applicativo Zigbee ─────────────────────────────────────── */
@@ -660,6 +789,9 @@ static void esp_zb_task(void *pv)
     /* Avvia il feed periodico del watchdog applicativo */
     s_zb_last_feed = xTaskGetTickCount();
     esp_zb_scheduler_alarm(zb_wdt_feed_cb, 0, ZB_WDT_FEED_INTERVAL_MS);
+
+    /* Avvia il keepalive ZDO verso il coordinator (island detection) */
+    esp_zb_scheduler_alarm(coordinator_ping_cb, 0, COORDINATOR_PING_TICK_MS);
 
     esp_zb_stack_main_loop();
 }
