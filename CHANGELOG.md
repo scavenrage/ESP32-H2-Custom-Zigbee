@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v1.6.0]
+
+- **Fix:** Brownout detector threshold lowered to level 0 (~2.43 V) in `sdkconfig.defaults` — the default threshold was triggering spurious brownout resets caused by fast 230 V switching transients coupled through the AC-input optoisolator (PCB B). The 5 V supply with 3.3 V LDO easily absorbs brief transients without compromising operation
+- **Fix:** All recovery-path restarts replaced with `esp_deep_sleep_start()` (3 s wakeup timer) — on ESP32-H2, `esp_restart()` issues a SW_CPU reset that leaves the IEEE 802.15.4 radio in a degraded state (LQI drops to 0, rejoin fails silently). Deep sleep wakeup is equivalent to a power cycle for the radio, ensuring a clean reinitialisation before any Zigbee stack activity
+- **New:** Boot-time reset reason check — at the very start of `app_main()`, before any Zigbee initialisation, the firmware checks `esp_reset_reason()`. If the reason is not POWERON, DEEPSLEEP, or EXT (i.e. it is a SW_CPU, brownout, panic, or watchdog reset), the firmware immediately enters deep sleep for 3 s. This prevents the device from attempting to rejoin on a degraded radio and avoids the previous 4–5 minute futile retry cycle
+- **New:** Post-steering address sanity check — after a successful `BDB_SIGNAL_STEERING`, the firmware verifies that `esp_zb_get_short_address() != 0xFFFF`. An address of 0xFFFF indicates corrupted ZBOSS state (bug #727: steering reports success but the radio is not actually associated). If detected, the firmware enters deep sleep immediately instead of entering an unrecoverable stuck state
+
 ## [v1.5.0]
 
 - **Fix:** ZDO keepalive callback never invoked on route error — when the NWK layer returns a route error (instead of waiting for a ZDP timeout), `coordinator_ping_result` was never called, leaving the device permanently stuck in double-blink with no further alarms scheduled. Added a 40 s safety timeout (`coordinator_ping_timeout_cb`): if the callback does not arrive within 40 seconds, failure is forced manually

@@ -37,3 +37,12 @@ CONFIG_ZB_ZCZR=y
 #
 CONFIG_IEEE802154_TIMING_OPTIMIZATION=y
 CONFIG_FREERTOS_HZ=1000
+
+#
+# Brownout detector — soglia minima (level 0, ~2.43V) per evitare false
+# attivazioni da transienti rapidi sulla linea 230V (commutazione switch/fotoaccoppiatore).
+# Il dispositivo è alimentato a 5V con LDO a 3.3V: un calo breve non compromette
+# il funzionamento, ma triggera il brownout detector con la soglia di default.
+#
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_0=y
+CONFIG_ESP_BROWNOUT_DET_LVL=0
