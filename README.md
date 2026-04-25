@@ -35,6 +35,8 @@ Designed for single-load automation and wall-switch retrofits.
 
 > For inductive loads a **snubber** is required.
 
+> If the 230 V optoisolated input is used: install a **100 nF 275 VAC X2 safety capacitor** between the line (L) and the switch input terminal (P). This suppresses fast switching transients on the mains line that would otherwise trigger the brownout detector and cause the device to disconnect from the Zigbee network.
+
 ---
 
 ### C) MOSFET / LED Control PCB
