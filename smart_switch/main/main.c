@@ -36,6 +36,7 @@
 #include "ha/esp_zigbee_ha_standard.h"
 #include "zdo/esp_zigbee_zdo_command.h"
 #include "esp_partition.h"
+#include "esp_sleep.h"
 #include <inttypes.h>
 #include <string.h>
 
@@ -78,16 +79,16 @@ static bool    s_ping_in_flight     = false;   /* ping inviato, attesa callback 
  * → intervallo effettivo = 60000 × 5 = 5 minuti.
  *
  * Se il coordinator non risponde per COORDINATOR_PING_MAX_FAILS cicli
- * consecutivi (≈ 4-5 min), il dispositivo si riavvia per ripristinare
- * da zero neighbor/routing table — l'unico modo affidabile per uscire
- * da uno stato di routing corrotto senza intervento manuale.
+ * consecutivi (≈ 4-5 min), il dispositivo è definitivamente disconnesso
+ * (tipicamente per interferenze RF) → zigbee_hard_reset(): cancella
+ * zb_storage/zb_fct e riavvia per un join pulito.
  *
  * COORDINATOR_PING_TIMEOUT_MS: timeout di sicurezza per il caso in cui
  * la callback ZDO non venga mai chiamata (route error anziché ZDP timeout).
  */
 #define COORDINATOR_PING_TICK_MS       60000    /* intervallo sicuro per scheduler  */
 #define COORDINATOR_PING_TICKS         5        /* 5 × 60s = 5 min tra i ping       */
-#define COORDINATOR_PING_MAX_FAILS     6        /* restart dopo 6 fail × ~45s ≈ 4-5 min */
+#define COORDINATOR_PING_MAX_FAILS     6        /* hard reset dopo 6 fail × ~45s ≈ 4-5 min */
 #define COORDINATOR_PING_TIMEOUT_MS    40000    /* timeout se callback non arriva   */
 static void coordinator_ping_cb(uint8_t param);         /* definita più in basso */
 static void coordinator_ping_timeout_cb(uint8_t param); /* definita più in basso */
@@ -116,6 +117,41 @@ static void ota_find_server(void)
     esp_zb_ota_upgrade_client_query_interval_set(s_ota_ep, OTA_UPGRADE_QUERY_INTERVAL);
     esp_zb_ota_upgrade_client_query_image_req(0x0000, 1);
     ESP_LOGI(TAG, "OTA: query → coordinator, polling ogni %d min", OTA_UPGRADE_QUERY_INTERVAL);
+}
+
+/* ── Zigbee hard reset (disconnessione definitiva) ───────────────────── */
+/*
+ * Chiamare quando il dispositivo è definitivamente disconnesso dal coordinator
+ * e i normali meccanismi di steering non bastano (tipicamente: interferenze RF
+ * che corrompono lo stato dello stack Zigbee).
+ *
+ * Cancella zb_storage e zb_fct → al prossimo avvio lo stack riparte da zero
+ * e fa un join pulito. La configurazione NVS (sw_cfg, relay, shutter, dimmer)
+ * rimane intatta.
+ *
+ * Dopo esp_restart() il reset reason sarà ESP_RST_SW: il check in app_main()
+ * triggera un deep sleep di 3s che resetta il radio, poi il device si riavvia
+ * con lo storage vuoto e fa il join.
+ */
+static void zigbee_hard_reset(const char *reason)
+{
+    ESP_LOGW(TAG, "*** ZIGBEE HARD RESET (%s) — cancello partizioni Zigbee ***", reason);
+    led_set_state(LED_ERROR);
+    const char *zb_parts[] = { "zb_storage", "zb_fct" };
+    for (int i = 0; i < 2; i++) {
+        const esp_partition_t *p = esp_partition_find_first(
+            ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, zb_parts[i]);
+        if (p) {
+            esp_err_t err = esp_partition_erase_range(p, 0, p->size);
+            ESP_LOGW(TAG, "  '%s' (0x%"PRIx32", %"PRIu32"B): %s",
+                     zb_parts[i], p->address, p->size,
+                     err == ESP_OK ? "OK" : esp_err_to_name(err));
+        } else {
+            ESP_LOGE(TAG, "  '%s': partizione non trovata!", zb_parts[i]);
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
 }
 
 /* ── Callback hardware → Zigbee ──────────────────────────────────────── */
@@ -490,6 +526,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
 
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err == ESP_OK) {
+            /* Sanity check: se l'indirizzo è 0xFFFF il radio è in stato corrotto
+             * (bug ZBOSS #727 — steering segnala successo ma il radio non è
+             * effettivamente associato). Stato non recuperabile → hard reset. */
+            if (esp_zb_get_short_address() == 0xFFFF) {
+                zigbee_hard_reset("addr=0xFFFF");
+            }
             zigbee_ready = true;
             ESP_LOGI(TAG, "Rete trovata: canale %d, PAN 0x%04hx, addr 0x%04hx — verifico coordinator...",
                      esp_zb_get_current_channel(),
@@ -602,10 +644,10 @@ static void coordinator_ping_result(esp_zb_zdp_status_t zdo_status,
         led_set_state(LED_ZIGBEE_SEARCHING);
 
         if (s_ping_fail_count >= COORDINATOR_PING_MAX_FAILS) {
-            /* Routing table/neighbor table probabilmente corrotti:
-             * l'unico recovery affidabile è un riavvio completo. */
-            ESP_LOGW(TAG, "Troppi fallimenti consecutivi — riavvio forzato");
-            esp_restart();
+            /* Disconnessione definitiva (tipicamente per interferenze RF):
+             * i retry normali non bastano. Hard reset: cancella lo storage
+             * Zigbee e riavvia per un join pulito. */
+            zigbee_hard_reset("ping fail");
         }
 
         esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
@@ -685,10 +727,11 @@ static void zb_watchdog_task(void *pv)
         vTaskDelay(pdMS_TO_TICKS(ZB_WDT_CHECK_INTERVAL_MS));
         TickType_t elapsed = xTaskGetTickCount() - s_zb_last_feed;
         if (elapsed > pdMS_TO_TICKS(ZB_WDT_TIMEOUT_MS)) {
-            ESP_LOGE("ZB_WDT", "Stack Zigbee non risponde da %lu s — riavvio!",
+            ESP_LOGE("ZB_WDT", "Stack Zigbee non risponde da %lu s — deep sleep 3s",
                      (unsigned long)(elapsed * portTICK_PERIOD_MS / 1000));
             vTaskDelay(pdMS_TO_TICKS(100));
-            esp_restart();
+            esp_sleep_enable_timer_wakeup(3ULL * 1000 * 1000);
+            esp_deep_sleep_start();
         }
     }
 }
@@ -799,6 +842,25 @@ static void esp_zb_task(void *pv)
 /* ── Entry point ─────────────────────────────────────────────────────── */
 void app_main(void)
 {
+    /* ── Controllo reset reason ──────────────────────────────────────────
+     * Solo POWERON, DEEPSLEEP e EXT garantiscono il radio IEEE 802.15.4 in
+     * stato pulito. Qualsiasi altro reset (SW_CPU dall'handler del brownout,
+     * BROWNOUT hardware, PANIC, WDT) può lasciare il radio in uno stato
+     * degradato che impedisce il rejoin anche se lo stack segnala successo.
+     * In quel caso forziamo un deep sleep di 3s: il wakeup è equivalente a
+     * un power cycle (rst:0x5 DEEPSLEEP) e garantisce la reinizializzazione
+     * completa del radio prima di tentare qualsiasi connessione Zigbee. */
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        if (rr != ESP_RST_POWERON &&
+            rr != ESP_RST_DEEPSLEEP &&
+            rr != ESP_RST_EXT) {
+            ESP_LOGW(TAG, "Reset non-pulito (reason=%d) — deep sleep 3s per reset radio", (int)rr);
+            esp_sleep_enable_timer_wakeup(3ULL * 1000 * 1000);
+            esp_deep_sleep_start();
+        }
+    }
+
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config  = ESP_ZB_DEFAULT_HOST_CONFIG(),
