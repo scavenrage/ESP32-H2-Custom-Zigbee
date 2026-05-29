@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v1.6.1]
+
+- **Fix:** RF-induced disconnection now triggers a Zigbee hard reset instead of a deep sleep loop — when 6 consecutive ZDO keepalive pings to the coordinator fail (≈ 4–5 minutes, typically caused by RF interference), the firmware now erases `zb_storage` and `zb_fct` and restarts, forcing a clean rejoin from scratch. The previous deep sleep loop could not self-recover because the corrupted Zigbee stack state persists in flash across deep sleep cycles and is not cleared by deep sleep wakeup. The same hard reset is applied when the post-steering address is `0xFFFF` (ZBOSS bug #727). The NVS configuration (channel types, timings, etc.) is not affected.
+
+---
+
 ## [v1.6.0]
 
 - **Fix:** Brownout detector threshold lowered to level 0 (~2.43 V) in `sdkconfig.defaults` — the default threshold was triggering spurious brownout resets caused by fast 230 V switching transients coupled through the AC-input optoisolator (PCB B). The 5 V supply with 3.3 V LDO easily absorbs brief transients without compromising operation

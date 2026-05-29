@@ -129,9 +129,10 @@ NVS configuration survives firmware OTA updates. Re-running `configure.py` and r
 - **Coordinator keepalive** — a ZDO `ieee_addr_req` is sent to the coordinator every 5 minutes to confirm the path is alive, detecting "island" scenarios where the device is connected to other routers but has no route to the coordinator
 - **ZDO timeout guard** — if the keepalive callback is never invoked (e.g. NWK route error instead of ZDP timeout), a 40 s safety alarm forces failure detection
 - **Periodic attribute reporting** — on every successful keepalive, relay states and shutter positions are reported to ZHA with `report=true`, keeping routes active and ZHA updated
-- **Clean-reset recovery** — all recovery paths (repeated coordinator failures, Zigbee watchdog, corrupted radio state at boot) use `esp_deep_sleep_start()` instead of `esp_restart()`. On ESP32-H2, a software reset leaves the IEEE 802.15.4 radio in a degraded state; deep sleep wakeup performs a full radio reinitialisation equivalent to a power cycle
+- **Zigbee hard reset on definitive disconnection** — if 6 consecutive ZDO keepalive pings to the coordinator fail (≈ 4–5 minutes, typically caused by RF interference), the firmware erases `zb_storage` and `zb_fct` and restarts, forcing a clean rejoin from scratch. Corrupted Zigbee stack state persists in flash across deep sleep cycles and cannot be recovered by steering alone; erasing the storage is the only reliable fix. NVS configuration is not affected.
+- **Clean-reset recovery** — the Zigbee watchdog and boot-time fault paths use `esp_deep_sleep_start()` instead of `esp_restart()`. On ESP32-H2, a software reset leaves the IEEE 802.15.4 radio in a degraded state; deep sleep wakeup performs a full radio reinitialisation equivalent to a power cycle
 - **Boot-time reset reason check** — at startup the firmware checks `esp_reset_reason()` and, if the reset was not a clean POWERON/DEEPSLEEP/EXT, enters deep sleep for 3 s before initialising the Zigbee stack, preventing rejoin attempts on a degraded radio
-- **Post-steering address check** — after every successful network steering the firmware verifies `esp_zb_get_short_address() != 0xFFFF`; if the address is invalid (ZBOSS bug #727), the device enters deep sleep immediately
+- **Post-steering address check** — after every successful network steering the firmware verifies `esp_zb_get_short_address() != 0xFFFF`; if the address is invalid (ZBOSS bug #727), the firmware triggers a Zigbee hard reset (erase storage + restart) instead of entering a deep sleep loop
 
 ---
 
@@ -213,8 +214,8 @@ Edit `smart_switch/main/ota.h` and increment `OTA_FILE_VERSION`:
 
 ```c
 /* Format: 0xMMNNPPPP — MM=major, NN=minor, PPPP=patch (16-bit) */
-#define OTA_FILE_VERSION  0x01060000   /* e.g. v1.6.0 */
-#define OTA_SW_BUILD_ID   "\x06""v1.6.0"
+#define OTA_FILE_VERSION  0x01060100   /* e.g. v1.6.1 */
+#define OTA_SW_BUILD_ID   "\x06""v1.6.1"
 ```
 
 **3b. Build and package the OTA image**
