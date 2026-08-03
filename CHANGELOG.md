@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v1.6.2]
+
+- **Fix:** Steering failure loop now triggers a PHY reset instead of retrying indefinitely — after 10 consecutive steering failures (≈ 5 minutes at 30 s intervals), the firmware erases the `phy_init` partition and restarts. `zb_storage` and `zb_fct` are left intact, so the device performs a normal rejoin without requiring permit join on the coordinator. Root cause: RF interference can corrupt the PHY calibration data stored in `phy_init` (`pll_cal exceeds 2ms`), causing the radio to fail every steering attempt in ~144 ms. Erasing `phy_init` forces the radio to recalibrate from scratch on the next boot.
+- **Fix:** `zigbee_hard_reset()` now also erases `phy_init` in addition to `zb_storage` and `zb_fct` — ensures a clean PHY state alongside a clean Zigbee credential state when a definitive disconnection is detected.
+
+---
+
 ## [v1.6.1]
 
 - **Fix:** RF-induced disconnection now triggers a Zigbee hard reset instead of a deep sleep loop — when 6 consecutive ZDO keepalive pings to the coordinator fail (≈ 4–5 minutes, typically caused by RF interference), the firmware now erases `zb_storage` and `zb_fct` and restarts, forcing a clean rejoin from scratch. The previous deep sleep loop could not self-recover because the corrupted Zigbee stack state persists in flash across deep sleep cycles and is not cleared by deep sleep wakeup. The same hard reset is applied when the post-steering address is `0xFFFF` (ZBOSS bug #727). The NVS configuration (channel types, timings, etc.) is not affected.
