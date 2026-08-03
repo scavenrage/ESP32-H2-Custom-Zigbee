@@ -65,11 +65,12 @@ static uint8_t s_ep_to_type[5];
 static uint8_t s_ch_to_ep[4];    /* ch 0..3 → ep */
 static uint8_t s_ota_ep = 1;
 
-static bool zigbee_ready           = false;
-static bool s_coordinator_confirmed = false;   /* true solo dopo ping ZDO riuscito */
-static uint8_t s_ping_tick          = 0;
-static uint8_t s_ping_fail_count    = 0;       /* fallimenti ZDO consecutivi       */
-static bool    s_ping_in_flight     = false;   /* ping inviato, attesa callback    */
+static bool zigbee_ready             = false;
+static bool s_coordinator_confirmed  = false;   /* true solo dopo ping ZDO riuscito */
+static uint8_t s_ping_tick           = 0;
+static uint8_t s_ping_fail_count     = 0;       /* fallimenti ZDO consecutivi       */
+static bool    s_ping_in_flight      = false;   /* ping inviato, attesa callback    */
+static uint8_t s_steering_fail_count = 0;       /* fallimenti steering consecutivi  */
 
 /* ── Keepalive: costanti e forward declaration ───────────────────────── */
 /*
@@ -90,6 +91,7 @@ static bool    s_ping_in_flight     = false;   /* ping inviato, attesa callback 
 #define COORDINATOR_PING_TICKS         5        /* 5 × 60s = 5 min tra i ping       */
 #define COORDINATOR_PING_MAX_FAILS     6        /* hard reset dopo 6 fail × ~45s ≈ 4-5 min */
 #define COORDINATOR_PING_TIMEOUT_MS    40000    /* timeout se callback non arriva   */
+#define STEERING_MAX_FAILS             10       /* phy reset dopo 10 fail × 30s ≈ 5 min */
 static void coordinator_ping_cb(uint8_t param);         /* definita più in basso */
 static void coordinator_ping_timeout_cb(uint8_t param); /* definita più in basso */
 
@@ -137,8 +139,8 @@ static void zigbee_hard_reset(const char *reason)
 {
     ESP_LOGW(TAG, "*** ZIGBEE HARD RESET (%s) — cancello partizioni Zigbee ***", reason);
     led_set_state(LED_ERROR);
-    const char *zb_parts[] = { "zb_storage", "zb_fct" };
-    for (int i = 0; i < 2; i++) {
+    const char *zb_parts[] = { "zb_storage", "zb_fct", "phy_init" };
+    for (int i = 0; i < 3; i++) {
         const esp_partition_t *p = esp_partition_find_first(
             ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, zb_parts[i]);
         if (p) {
@@ -149,6 +151,28 @@ static void zigbee_hard_reset(const char *reason)
         } else {
             ESP_LOGE(TAG, "  '%s': partizione non trovata!", zb_parts[i]);
         }
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
+}
+
+/* Cancella solo la calibrazione PHY e riavvia.
+ * zb_storage/zb_fct restano intatti: al prossimo avvio il device
+ * ricalibra il radio da zero e fa un rejoin con le credenziali esistenti.
+ * Non richiede permit join sul coordinator. */
+static void zigbee_phy_reset(const char *reason)
+{
+    ESP_LOGW(TAG, "*** ZIGBEE PHY RESET (%s) — cancello phy_init ***", reason);
+    led_set_state(LED_ERROR);
+    const esp_partition_t *p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, "phy_init");
+    if (p) {
+        esp_err_t err = esp_partition_erase_range(p, 0, p->size);
+        ESP_LOGW(TAG, "  'phy_init' (0x%"PRIx32", %"PRIu32"B): %s",
+                 p->address, p->size,
+                 err == ESP_OK ? "OK" : esp_err_to_name(err));
+    } else {
+        ESP_LOGE(TAG, "  'phy_init': partizione non trovata!");
     }
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
@@ -532,6 +556,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             if (esp_zb_get_short_address() == 0xFFFF) {
                 zigbee_hard_reset("addr=0xFFFF");
             }
+            s_steering_fail_count = 0;
             zigbee_ready = true;
             ESP_LOGI(TAG, "Rete trovata: canale %d, PAN 0x%04hx, addr 0x%04hx — verifico coordinator...",
                      esp_zb_get_current_channel(),
@@ -542,7 +567,15 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             s_ping_tick = COORDINATOR_PING_TICKS - 1;   /* prossimo tick → ping subito */
             esp_zb_scheduler_alarm(coordinator_ping_cb, 0, 1000);
         } else {
-            ESP_LOGW(TAG, "Steering fallito, riprovo tra 30s...");
+            s_steering_fail_count++;
+            ESP_LOGW(TAG, "Steering fallito (%d/%d), riprovo tra 30s...",
+                     s_steering_fail_count, STEERING_MAX_FAILS);
+            if (s_steering_fail_count >= STEERING_MAX_FAILS) {
+                /* Calibrazione PHY probabilmente corrotta (interferenza RF).
+                 * PHY reset: cancella phy_init e riavvia — zb_storage intatta,
+                 * il device farà un rejoin senza permit join. */
+                zigbee_phy_reset("steering loop");
+            }
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
                                    ESP_ZB_BDB_MODE_NETWORK_STEERING, 30000);
         }
