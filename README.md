@@ -24,7 +24,18 @@ A compact, modular relay board for multi-channel automation.
 
 ---
 
-### B) Single-Relay PCB (Universal Variant)
+### B) Opto Input Hat (for PCB A)
+
+A companion board that adds mains-voltage input sensing to PCB A, whose native inputs only accept 3.3 V digital signals (dry-contact switches).
+
+- Up to **4 optoisolated inputs**, one per channel
+- Each input: series resistor (150 kΩ) into an **H11AA1M** AC-sensing optocoupler — unlike a standard phototransistor optocoupler, the H11AA1 has two anti-parallel internal LEDs, so it responds correctly to a 230 VAC phase signal without needing rectification
+- **Cuttable PCB**: trimmable to 2, 3, or 4 channels, matching however many inputs of PCB A it is paired with
+- Lets PCB A be triggered by real mains-phase switches instead of only dry-contact ones
+
+---
+
+### C) Single-Relay PCB (Universal Variant)
 
 Designed for single-load automation and wall-switch retrofits.
 
@@ -50,14 +61,14 @@ Solid-state output board for LED lamps and drivers with an external low-voltage 
 
 ---
 
-### D) Opto Input Hat (for PCB C)
+### D) Opto Input Hat (for PCB A)
 
-A companion board that adds mains-voltage input sensing to the MOSFET/LED PCB (variant C), whose native input only accepts 3.3 V digital signals.
+A companion board that adds mains-voltage input sensing to the 4-channel relay PCB (variant A), whose native inputs only accept 3.3 V digital signals (dry-contact switches).
 
 - Up to **4 optoisolated inputs**, one per channel
 - Each input: series resistor (150 kΩ) into an **H11AA1M** AC-sensing optocoupler — unlike a standard phototransistor optocoupler, the H11AA1 has two anti-parallel internal LEDs, so it responds correctly to a 230 VAC phase signal without needing rectification
-- **Cuttable PCB**: trimmable to 2, 3, or 4 channels, matching however many channels of PCB C it is paired with
-- Lets PCB C be triggered by real mains-phase switches instead of only touch modules or low-voltage digital inputs
+- **Cuttable PCB**: trimmable to 2, 3, or 4 channels, matching however many inputs of PCB A it is paired with
+- Lets PCB A be triggered by real mains-phase switches instead of only dry-contact ones
 
 ---
 
