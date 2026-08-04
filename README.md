@@ -194,7 +194,7 @@ esptool.py --port COM12 write_flash 0x9000 nvs_config.bin
 Requires ESP-IDF v5.1.2. Run the following from the **ESP-IDF terminal**:
 
 ```cmd
-cd smart_switch
+cd firmware
 idf.py set-target esp32h2
 idf.py build
 idf.py flash
@@ -211,7 +211,7 @@ OTA updates replace the firmware without touching the NVS configuration.
 
 **3a. Bump the firmware version**
 
-Edit `smart_switch/main/ota.h` and increment `OTA_FILE_VERSION`:
+Edit `firmware/main/ota.h` and increment `OTA_FILE_VERSION`:
 
 ```c
 /* Format: 0xMMNNPPPP — MM=major, NN=minor, PPPP=patch (16-bit) */
@@ -223,7 +223,7 @@ Edit `smart_switch/main/ota.h` and increment `OTA_FILE_VERSION`:
 
 ```cmd
 idf.py build
-python make_ota.py smart_switch
+python make_ota.py firmware
 ```
 
 This generates `smart_switch-vX.Y.Z.ota` in the same folder as `make_ota.py`.
@@ -236,24 +236,5 @@ This generates `smart_switch-vX.Y.Z.ota` in the same folder as `make_ota.py`.
 
 ---
 
-## Repository Structure
-
-```
-Zigbee/
-├── configure.py            — configuration wizard (generates nvs_config.csv + nvs_config.bin)
-├── make_ota.py             — packages a build into a Zigbee OTA .ota image
-├── binaries/               — pre-built binaries for direct flashing
-│   ├── bootloader.bin
-│   ├── partition-table.bin
-│   ├── ota_data_initial.bin
-│   └── smart_switch.bin
-└── smart_switch/           — ESP-IDF firmware project
-    ├── main/
-    ├── CMakeLists.txt
-    ├── partitions.csv
-    └── sdkconfig.defaults
-```
-
----
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
