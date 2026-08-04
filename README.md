@@ -63,7 +63,7 @@ Solid-state output board for LED lamps and drivers with an external low-voltage 
 
 ## Channel Types
 
-On **PCB A and B** (relay outputs), each channel is independently configured via `configure.py` and channel types can be freely mixed on the same device — e.g. channel 1 as a roller shutter, channel 2 as a stable relay, channel 3 as an impulse relay:
+On **PCB A and C** (relay outputs), each channel is independently configured via `configure.py` and channel types can be freely mixed on the same device — e.g. channel 1 as a roller shutter, channel 2 as a stable relay, channel 3 as an impulse relay:
 
 | Type | Description |
 |------|-------------|
@@ -72,7 +72,7 @@ On **PCB A and B** (relay outputs), each channel is independently configured via
 | Roller shutter | Paired UP/DOWN outputs with travel-time calibration and position tracking |
 | Unused | Channel disabled |
 
-**PCB C** (MOSFET/LED) uses a solid-state output stage instead of relays, so it runs a separate channel type not available on A/B:
+**PCB D** (MOSFET/LED) uses a solid-state output stage instead of relays, so it runs a separate channel type not available on A/C:
 
 | Type | Description |
 |------|-------------|
@@ -87,14 +87,14 @@ On **PCB A and B** (relay outputs), each channel is independently configured via
 | Output | GPIO 4 | GPIO 5 | GPIO 10 | GPIO 11 |
 | Input  | GPIO 1 | GPIO 0 | GPIO 3  | GPIO 2  |
 
-Status LED: **GPIO 22** *(PCB A and B only — not present on PCB C)*  
+Status LED: **GPIO 22** *(PCB A and C only — not present on PCB D)*  
 Factory Reset: **GPIO 9** (BOOT button — hold 5 s)
 
 ---
 
 ## Status LED
 
-> The status LED (GPIO 22) is present on **PCB A (4-channel relay)** and **PCB B (single relay)** only. PCB C (MOSFET/dimmer) does not have an onboard LED.
+> The status LED (GPIO 22) is present on **PCB A (4-channel relay)** and **PCB C (single relay)** only. PCB D (MOSFET/dimmer) does not have an onboard LED.
 
 | Pattern | Meaning |
 |---------|---------|
