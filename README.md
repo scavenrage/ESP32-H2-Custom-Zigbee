@@ -8,7 +8,7 @@ A family of Zigbee-based controllers built around the **ESP32-H2**, designed for
 
 ## PCB Variants
 
-All three variants run the **same firmware**, configured per-device via `configure.py`.
+All variants run the **same firmware**, configured per-device via `configure.py`.
 
 ### A) 4-Channel Relay PCB
 
@@ -50,17 +50,33 @@ Solid-state output board for LED lamps and drivers with an external low-voltage 
 
 ---
 
+### D) Opto Input Hat (for PCB C)
+
+A companion board that adds mains-voltage input sensing to the MOSFET/LED PCB (variant C), whose native input only accepts 3.3 V digital signals.
+
+- Up to **4 optoisolated inputs**, one per channel
+- Each input: series resistor (150 kΩ) into an **H11AA1M** AC-sensing optocoupler — unlike a standard phototransistor optocoupler, the H11AA1 has two anti-parallel internal LEDs, so it responds correctly to a 230 VAC phase signal without needing rectification
+- **Cuttable PCB**: trimmable to 2, 3, or 4 channels, matching however many channels of PCB C it is paired with
+- Lets PCB C be triggered by real mains-phase switches instead of only touch modules or low-voltage digital inputs
+
+---
+
 ## Channel Types
 
-Each output channel is independently configured via `configure.py`:
+On **PCB A and B** (relay outputs), each channel is independently configured via `configure.py` and channel types can be freely mixed on the same device — e.g. channel 1 as a roller shutter, channel 2 as a stable relay, channel 3 as an impulse relay:
 
 | Type | Description |
 |------|-------------|
 | Stable relay | Standard ON/OFF — state saved in NVS, restored at power-on |
 | Impulse relay | Output pulses for a configurable duration, then returns OFF |
 | Roller shutter | Paired UP/DOWN outputs with travel-time calibration and position tracking |
-| PWM dimmer | LEDC-based dimmer with fade, long-press dimming, NVS state persistence (channel 1 only) |
 | Unused | Channel disabled |
+
+**PCB C** (MOSFET/LED) uses a solid-state output stage instead of relays, so it runs a separate channel type not available on A/B:
+
+| Type | Description |
+|------|-------------|
+| PWM dimmer | LEDC-based dimmer with fade, long-press dimming, NVS state persistence (channel 1 only) |
 
 ---
 
