@@ -17,3 +17,14 @@ firmware/sdkconfig.old
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Development notes / AI session transcripts (private)
+chat-claude-code/
+
+# Local working files (serial logs, flash dumps, generated per-device config, local flashing kit)
+tools/logs/
+tools/kit_programmazione/
+*_dump*.bin
+nvs_dump*.bin
+nvs_config.bin
+nvs_config.csv

@@ -7,6 +7,7 @@
  */
 
 #include "ota.h"
+#include "diag.h"
 #include "esp_ota_ops.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -14,6 +15,8 @@
 #include <inttypes.h>
 
 static const char *TAG = "OTA";
+
+#if ZB_OTA_ENABLED   /* ZB2: OTA Zigbee non supportato dal livello di compatibilità, vedi ota.h */
 
 /* Stato corrente del trasferimento OTA */
 static esp_ota_handle_t      s_ota_handle        = 0;
@@ -171,6 +174,7 @@ esp_err_t ota_upgrade_handler(const esp_zb_zcl_ota_upgrade_value_message_t *mess
             ESP_LOGW(TAG, "APPLY: s_ota_handle già zero (FINISH già eseguito? ok)");
         }
         ESP_LOGI(TAG, "Riavvio...");
+        diag_set_restart_cause(DIAG_CAUSE_OTA);
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
         break;
@@ -193,8 +197,10 @@ esp_err_t ota_upgrade_handler(const esp_zb_zcl_ota_upgrade_value_message_t *mess
     return ret;
 }
 
+#endif /* ZB_OTA_ENABLED */
+
 /* ------------------------------------------------------------------ */
-/*  Anti-rollback                                                      */
+/*  Anti-rollback                                                    */
 /* ------------------------------------------------------------------ */
 
 void ota_mark_valid(void)

@@ -1,6 +1,6 @@
 ## IDF Component Manager Manifest File
+# Prova con esp-zigbee-lib 2.x (stack Espressif, senza ZBOSS) tramite il livello di compatibilità 1.x.
 dependencies:
-  espressif/esp-zboss-lib: "~1.6.0"
-  espressif/esp-zigbee-lib: "~1.6.0"
+  espressif/esp-zigbee-lib: "~2.0.0"
   idf:
     version: ">=5.0.0"

@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartSwitch - BLE update</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 1.3rem; }
+  button { font-size: 1rem; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  progress { width: 100%; height: 22px; }
+  #log { background: #111; color: #ddd; padding: 10px; border-radius: 6px; height: 240px; overflow-y: auto;
+         font-family: ui-monospace, monospace; font-size: .85rem; white-space: pre-wrap; }
+  .box { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin: 12px 0; }
+  .warn { color: #b00; }
+</style>
+</head>
+<body>
+<h1>SmartSwitch - firmware update over Bluetooth</h1>
+
+<p id="nobt" class="warn" style="display:none">
+  This browser does not support Web Bluetooth. Use Chrome or Edge (desktop or Android).
+</p>
+
+<div class="box">
+  <b>1.</b> Put the device in BLE update mode (BLE switch in Home Assistant; LED blinks slowly).<br>
+  <b>2.</b> <button id="btnFile">Choose the .bin file…</button> <span id="fileInfo">no file</span>
+  <input type="file" id="file" accept=".bin" style="display:none"><br>
+  <label><input type="checkbox" id="chkErase"> Erase the Zigbee credentials at the end
+    (the device starts from scratch and must be paired again in ZHA)</label><br>
+  <b>3.</b> <button id="btnSend" disabled>Find device and send</button>
+  <button id="btnAbort" disabled>Cancel</button>
+</div>
+
+<div class="box">
+  <b>Zigbee credentials only</b> (no firmware update): <button id="btnErase">Erase Zigbee credentials</button><br>
+  <small>Erases the Zigbee network data and restarts the device in normal mode. The configuration
+  (channels, shutters) is kept. Then pair the device again in ZHA.</small>
+</div>
+
+<progress id="bar" value="0" max="100"></progress>
+<div id="status">Waiting.</div>
+<div id="log"></div>
+
+<script>
+const SERVICE = '6a1d0001-c0de-4b1e-8b5e-5a1e7c0d0001';
+const CTRL    = '6a1d0002-c0de-4b1e-8b5e-5a1e7c0d0001';
+const DATA    = '6a1d0003-c0de-4b1e-8b5e-5a1e7c0d0001';
+
+const CMD_START = 1, CMD_FINISH = 2, CMD_ABORT = 3, CMD_ERASE_ON_EXIT = 4, CMD_ERASE_NOW = 5;
+const N_READY = 0x10, N_PROGRESS = 0x11, N_DONE = 0x12, N_ERASE = 0x13, N_ERROR = 0x7f;
+const WINDOW = 8192;          // bytes sent but not yet acknowledged
+const MAX_IMAGE = 0x180000;   // size of the OTA partition
+const ERRORS = {
+  1: 'command out of sequence', 2: 'invalid size or different from the announced one',
+  3: 'cannot start writing to flash', 4: 'flash write error',
+  5: 'invalid image', 6: 'image of another project', 7: 'cannot set the boot partition'
+};
+
+const $ = id => document.getElementById(id);
+const log = m => { const t = new Date().toLocaleTimeString(); $('log').textContent += `[${t}] ${m}\n`; $('log').scrollTop = 1e9; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+let fileData = null, device = null, ctrl = null, dataChr = null;
+let state = null;             // state of the transfer in progress
+
+if (!navigator.bluetooth) $('nobt').style.display = 'block';
+
+$('btnFile').onclick = () => $('file').click();
+$('file').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const buf = new Uint8Array(await f.arrayBuffer());
+  if (buf.length === 0 || buf.length > MAX_IMAGE) { alert('Invalid file size.'); return; }
+  if (buf[0] !== 0xE9) { alert('This does not look like an ESP32 firmware (first byte is not 0xE9).'); return; }
+  fileData = buf;
+  $('fileInfo').textContent = `${f.name} (${buf.length} byte)`;
+  $('btnSend').disabled = !navigator.bluetooth;
+};
+
+function setStatus(t) { $('status').textContent = t; }
+
+function onNotify(ev) {
+  const v = ev.target.value;
+  const code = v.getUint8(0), val = v.getUint32(1, true);
+  if (!state) return;
+  if (code === N_READY)    { state.ready = val; }
+  else if (code === N_PROGRESS) { state.acked = val; state.lastAck = Date.now(); }
+  else if (code === N_DONE)     { state.done = true; }
+  else if (code === N_ERASE)    { state.erase = val; }
+  else if (code === N_ERROR)    { state.error = ERRORS[val] || `error ${val}`; }
+}
+
+async function waitFor(cond, timeoutMs, what) {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (state.error) throw new Error(state.error);
+    if (state.disconnected) throw new Error('device disconnected');
+    if (state.abort) throw new Error('cancelled');
+    if (Date.now() - t0 > timeoutMs) throw new Error(`timeout waiting for: ${what}`);
+    await sleep(20);
+  }
+}
+
+async function writeCtrl(bytes) { await ctrl.writeValueWithResponse(new Uint8Array(bytes)); }
+
+async function sendFirmware() {
+  const size = fileData.length;
+  state = { ready: 0, acked: 0, lastAck: Date.now(), done: false, error: null, disconnected: false, abort: false };
+
+  setStatus('Searching for the device…');
+  device = await navigator.bluetooth.requestDevice({
+    filters: [{ namePrefix: 'SmartSwitch-' }], optionalServices: [SERVICE]
+  });
+  log(`Selected: ${device.name}`);
+  device.addEventListener('gattserverdisconnected', () => { if (state) state.disconnected = true; log('Device disconnected.'); });
+
+  setStatus('Connecting…');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SERVICE);
+  ctrl = await svc.getCharacteristic(CTRL);
+  dataChr = await svc.getCharacteristic(DATA);
+  await ctrl.startNotifications();
+  ctrl.addEventListener('characteristicvaluechanged', onNotify);
+  log('Connected, notifications on.');
+
+  if ($('chkErase').checked) {
+    await writeCtrl([CMD_ERASE_ON_EXIT]);
+    await waitFor(() => state.erase === 1, 5000, 'confirmation of the credentials erase');
+    log('Zigbee credentials: they will be erased at the end, before the restart.');
+  }
+
+  setStatus('Starting the transfer…');
+  await writeCtrl([CMD_START, size & 255, (size >> 8) & 255, (size >> 16) & 255, (size >>> 24) & 255]);
+  await waitFor(() => state.ready > 0, 10000, 'start confirmation');
+  const chunk = Math.max(20, Math.min(state.ready, 500));
+  log(`Chunks of ${chunk} bytes, image of ${size} bytes.`);
+
+  const t0 = Date.now();
+  let sent = 0;
+  state.lastAck = Date.now();
+  while (sent < size) {
+    await waitFor(() => sent - state.acked <= WINDOW, 20000, 'receive acknowledgement');
+    if (Date.now() - state.lastAck > 20000) throw new Error('no acknowledgement from the device for 20 s');
+    const end = Math.min(sent + chunk, size);
+    const part = fileData.subarray(sent, end);
+    if (dataChr.writeValueWithoutResponse) await dataChr.writeValueWithoutResponse(part);
+    else await dataChr.writeValue(part);
+    sent = end;
+    const pct = Math.floor(sent * 100 / size);
+    $('bar').value = pct;
+    const sec = (Date.now() - t0) / 1000;
+    setStatus(`Sending… ${pct}%  (${(sent / 1024).toFixed(0)} KB, ${(sent / 1024 / Math.max(sec, 0.1)).toFixed(1)} KB/s)`);
+  }
+
+  setStatus('Final check…');
+  await waitFor(() => state.acked >= size - (size % 4096), 20000, 'last acknowledgements');
+  await sleep(800);
+  await writeCtrl([CMD_FINISH]);
+  await waitFor(() => state.done, 30000, 'result of the check');
+  $('bar').value = 100;
+  setStatus('Update completed: the device restarts with the new firmware.');
+  log(`Done in ${((Date.now() - t0) / 1000).toFixed(0)} s.`);
+}
+
+$('btnSend').onclick = async () => {
+  $('btnSend').disabled = true; $('btnAbort').disabled = false; $('btnFile').disabled = true;
+  try {
+    await sendFirmware();
+  } catch (err) {
+    log(`ERROR: ${err.message}`);
+    setStatus(`Error: ${err.message}`);
+    try { if (ctrl && device && device.gatt.connected) await writeCtrl([CMD_ABORT]); } catch (_) {}
+  } finally {
+    try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
+    $('btnSend').disabled = false; $('btnAbort').disabled = true; $('btnFile').disabled = false;
+  }
+};
+
+$('btnAbort').onclick = () => { if (state) state.abort = true; };
+
+async function eraseOnly() {
+  state = { ready: 0, acked: 0, lastAck: Date.now(), done: false, error: null, disconnected: false, abort: false, erase: 0 };
+
+  setStatus('Searching for the device…');
+  device = await navigator.bluetooth.requestDevice({
+    filters: [{ namePrefix: 'SmartSwitch-' }], optionalServices: [SERVICE]
+  });
+  log(`Selected: ${device.name}`);
+  device.addEventListener('gattserverdisconnected', () => { if (state) state.disconnected = true; log('Device disconnected.'); });
+
+  setStatus('Connecting…');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SERVICE);
+  ctrl = await svc.getCharacteristic(CTRL);
+  await ctrl.startNotifications();
+  ctrl.addEventListener('characteristicvaluechanged', onNotify);
+  log('Connected, notifications on.');
+
+  setStatus('Erasing the Zigbee credentials…');
+  await writeCtrl([CMD_ERASE_NOW]);
+  await waitFor(() => state.erase === 2, 20000, 'erase confirmation');
+  setStatus('Credentials erased: the device restarts. Pair it again in ZHA.');
+  log('Zigbee credentials erased, the device restarts in normal mode.');
+}
+
+$('btnErase').onclick = async () => {
+  if (!confirm('Erase the Zigbee credentials of the device? It must then be paired again in ZHA.')) return;
+  $('btnErase').disabled = true; $('btnSend').disabled = true;
+  try {
+    await eraseOnly();
+  } catch (err) {
+    log(`ERROR: ${err.message}`);
+    setStatus(`Error: ${err.message}`);
+  } finally {
+    try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
+    $('btnErase').disabled = false; $('btnSend').disabled = !fileData || !navigator.bluetooth;
+  }
+};
+</script>
+</body>
+</html>

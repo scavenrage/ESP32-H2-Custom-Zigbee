@@ -1,6 +1,8 @@
 # Custom Zigbee Controller – ESP32-H2
 
-A family of Zigbee-based controllers built around the **ESP32-H2**, designed for lighting automation, shutter/blind control, switch retrofitting, and LED dimming. Multiple PCB variants are available to fit different installation scenarios. All devices operate as **Zigbee routers** and support **Zigbee OTA firmware updates**.
+A family of Zigbee-based controllers built around the **ESP32-H2**, designed for lighting automation, shutter/blind control, switch retrofitting, and LED dimming. Multiple PCB variants are available to fit different installation scenarios. All devices operate as **Zigbee routers** and are integrated in **Home Assistant (ZHA)**.
+
+Since **v2.0.0** the firmware runs on the Espressif Zigbee stack **esp-zigbee-lib 2.x** (no ZBOSS), and firmware updates are done **over Bluetooth LE** from a web page or by cable (Zigbee OTA has been removed, see [Firmware updates](#firmware-updates)).
 
 **PCB designs:**  https://oshwlab.com/scavenrage/project_oyjbpylj
 
@@ -88,7 +90,8 @@ On **PCB A and C** (relay outputs), each channel is independently configured via
 | Input  | GPIO 1 | GPIO 0 | GPIO 3  | GPIO 2  |
 
 Status LED: **GPIO 22** *(PCB A and C only — not present on PCB D)*  
-Factory Reset: **GPIO 9** (BOOT button — hold 5 s)
+BOOT button: **GPIO 9** (hold 5 s = Zigbee factory reset; short press = turn the BLE log off)  
+Serial console: **UART0, 115200 baud** (TX/RX on the 4-pin programming header of PCB A)
 
 ---
 
@@ -99,28 +102,52 @@ Factory Reset: **GPIO 9** (BOOT button — hold 5 s)
 | Pattern | Meaning |
 |---------|---------|
 | Fast blink (100 ms) | Booting |
-| Double blink every 2 s | Searching for Zigbee network |
+| Double blink every 2 s | Searching for Zigbee network / coordinator not confirmed yet |
 | Single blink every 5 s | Operational (heartbeat) |
-| Slow blink (500 ms on/off) | OTA firmware download in progress |
+| Slow blink (500 ms on/off) | BLE update mode |
 | 3 fast blinks every 3 s | Error |
 | Solid on | Factory reset countdown in progress |
 
 ---
 
-## Factory Reset
+## Home Assistant (ZHA)
 
-The **BOOT button (GPIO 9)** doubles as a Zigbee factory reset trigger at any time after power-up.
+### Endpoints
 
-**How to use:**
+| Endpoint | Content |
+|----------|---------|
+| 1…4 | One endpoint per active channel: **On/Off** (relays, dimmer) or **Window Covering** (shutters). EP1 also hosts the diagnostic cluster |
+| 10 | Virtual switch **BLE** — restarts the device in BLE update mode |
+| 11 | Virtual switch **PROG** — restarts the device in serial download mode (ROM bootloader) |
+| 12 | Virtual switch **RESCRED** — Zigbee factory reset (erases the network credentials) |
+| 13 | Virtual switch **LOG** — turns the live log over Bluetooth on/off (kept across restarts) |
 
-1. Hold the BOOT button for **5 seconds** — the status LED switches to solid white during the countdown.
-2. Release after 5 s — the device erases all Zigbee network data (`zb_storage` and `zb_fct` partitions) and reboots.
-3. After reboot, the device starts fresh network steering and can be added to a new Zigbee network (e.g. via ZHA → Add device).
+The real state of the virtual switches is reported to ZHA every time the device becomes operational, so Home Assistant does not keep showing an old value after a restart.
 
-**Notes:**
-- Releasing the button before the 5 s window cancels the reset and returns the LED to its previous state.
-- The NVS configuration (channel types, timings, etc.) is **not** affected — only the Zigbee network credentials are erased.
-- The first 10 s after power-up are ignored to avoid false triggers at boot.
+### Quirk (optional)
+
+`ha/smartswitch_diag.py` is a ZHA quirk (v2) for the model `SmartSwitchO` by `Handmade!`:
+
+- names the virtual switches **BLE**, **PROG**, **RESCRED**, **LOG** (otherwise ZHA shows generic switch names);
+- exposes the private diagnostic cluster **0xFF11** and a diagnostic sensor **"Riavvii anomali"** (unexpected restarts).
+
+Install: copy the file to `/config/custom_zha_quirks/` (with `custom_quirks_path` set in the ZHA configuration), restart Home Assistant, then press **Reconfigure** on the device. Everything else (relays, shutters, dimmer) works without the quirk.
+
+### Diagnostic cluster 0xFF11
+
+Counters stored in NVS (namespace `diag`), readable from ZHA (*Manage Zigbee device → Clusters → SmartSwitch Diag → Read attribute*):
+
+| Attr | Name | Meaning |
+|------|------|---------|
+| 0x0000 | uptime_s | Seconds since boot |
+| 0x0001 | boots | Number of boots |
+| 0x0002 | last_event | Last reset reason (`esp_reset_reason`) or 100 + firmware cause |
+| 0x0003…0x0007 | rr_poweron, rr_brownout, rr_panic, rr_wdt, sw_untagged | Reset reasons |
+| 0x0008…0x000B | cs_zb_wdt, cs_hard_reset, cs_phy_reset, cs_other | Restarts commanded by the firmware |
+| 0x000C…0x000F | ev_ping_fail, ev_no_links, ev_leave, ev_steer_fail | Network events |
+| 0x0010 | unexpected_resets | brownout + panic + watchdog + untagged software resets |
+
+After every boot the device sends a single report of `unexpected_resets` to the coordinator, so an automation can warn when a device restarts unexpectedly. Do **not** configure attribute reporting on cluster 0xFF11 from ZHA.
 
 ---
 
@@ -130,26 +157,40 @@ The **BOOT button (GPIO 9)** doubles as a Zigbee factory reset trigger at any ti
 
 Device behaviour is configured at **first programming** using `configure.py`, which generates an NVS partition (`nvs_config.bin`) containing all parameters. The firmware reads this partition at boot — no recompilation needed to change a device's function.
 
-NVS configuration survives firmware OTA updates. Re-running `configure.py` and reflashing only the NVS partition (address `0x9000`) is enough to change a device's behaviour.
+The configuration survives firmware updates. Re-running `configure.py` and reflashing only the NVS partition (address `0x9000`) changes a device's behaviour; since v2.0.0 the Zigbee data also lives in the NVS partition, so rewriting it means **pairing the device again**.
 
 ### Zigbee
 
-- Operates exclusively as a **Zigbee router**
-- Exposes one endpoint per active channel
+- Stack: **esp-zigbee-lib 2.x** through its 1.x compatibility layer (`CONFIG_ZB_SDK_1xx`)
+- Operates exclusively as a **Zigbee router**; joins a coordinator on **any channel (11–26)**
+- Exposes one endpoint per active channel plus the maintenance endpoints 10–13
 - **On/Off cluster (0x0006)** for relay and dimmer channels
-- **Window Covering cluster (0x0102)** for roller shutter channels
-- **OTA Upgrade cluster (0x0019)** for wireless firmware updates
+- **Window Covering cluster (0x0102)** for roller shutter channels; when a shutter stops (end of travel or STOP) its final position is reported explicitly, so Home Assistant shows 0 % / 100 % immediately also when the shutter is moved with the wall buttons
+- Network data stored in the default NVS partition (namespace `zigbee`); devices coming from v1.x are migrated automatically (see below)
 
 ### Connection resilience
 
 - **Coordinator keepalive** — a ZDO `ieee_addr_req` is sent to the coordinator every 5 minutes to confirm the path is alive, detecting "island" scenarios where the device is connected to other routers but has no route to the coordinator
 - **ZDO timeout guard** — if the keepalive callback is never invoked (e.g. NWK route error instead of ZDP timeout), a 40 s safety alarm forces failure detection
-- **Periodic attribute reporting** — on every successful keepalive, relay states and shutter positions are reported to ZHA with `report=true`, keeping routes active and ZHA updated
-- **Zigbee hard reset on definitive disconnection** — if 6 consecutive ZDO keepalive pings to the coordinator fail (≈ 4–5 minutes, typically caused by RF interference), the firmware erases `zb_storage`, `zb_fct`, and `phy_init` and restarts, forcing a clean rejoin from scratch. Corrupted Zigbee stack state persists in flash across deep sleep cycles and cannot be recovered by steering alone; erasing the storage is the only reliable fix. NVS configuration is not affected.
-- **PHY reset on persistent steering failure** — if network steering fails 10 consecutive times (≈ 5 minutes), the firmware erases only the `phy_init` partition (RF PHY calibration data) and restarts. `zb_storage` and `zb_fct` are left intact, so the device can rejoin without requiring permit join on the coordinator. Root cause: RF interference can corrupt the PHY calibration stored in `phy_init` (`pll_cal exceeds 2ms`), causing every steering attempt to fail in ~144 ms. Erasing `phy_init` forces the radio to recalibrate from scratch on the next boot.
-- **Clean-reset recovery** — the Zigbee watchdog and boot-time fault paths use `esp_deep_sleep_start()` instead of `esp_restart()`. On ESP32-H2, a software reset leaves the IEEE 802.15.4 radio in a degraded state; deep sleep wakeup performs a full radio reinitialisation equivalent to a power cycle
-- **Boot-time reset reason check** — at startup the firmware checks `esp_reset_reason()` and, if the reset was not a clean POWERON/DEEPSLEEP/EXT, enters deep sleep for 3 s before initialising the Zigbee stack, preventing rejoin attempts on a degraded radio
-- **Post-steering address check** — after every successful network steering the firmware verifies `esp_zb_get_short_address() != 0xFFFF`; if the address is invalid (ZBOSS bug #727), the firmware triggers a Zigbee hard reset (erase storage + restart) instead of entering a deep sleep loop
+- **Periodic attribute sync** — on every successful keepalive, relay states and shutter positions are written again, keeping routes active and ZHA updated
+- **Zigbee hard reset on definitive disconnection** — if 6 consecutive keepalive pings fail (≈ 4–5 minutes, typically RF interference), the firmware erases the Zigbee network data and `phy_init` and restarts, forcing a clean rejoin. The channel configuration is not affected
+- **PHY reset on persistent steering failure** — after 10 consecutive steering failures (≈ 5 minutes) the firmware erases only `phy_init` (RF calibration data) and restarts; the network credentials are kept, so the device rejoins without permit join
+- **Clean-reset recovery** — after an unclean reset (panic, watchdog, brownout, software reset without a recorded cause) the device enters deep sleep for 3 s before starting Zigbee: on ESP32-H2 a software reset can leave the 802.15.4 radio degraded, a deep sleep wakeup reinitialises it like a power cycle. Restarts requested by the user (BLE update, factory reset, serial `reset`, BLE log switch) skip the deep sleep
+- **Zigbee watchdog** — if the Zigbee stack stops running its scheduled tasks for more than 3 minutes, the device enters deep sleep for 3 s
+- **Thread-safe stack access** — events from the physical inputs and from timers reach the Zigbee stack through its lock (required by esp-zigbee-lib 2.x)
+
+### Maintenance over Bluetooth LE
+
+Bluetooth and Zigbee share the single ESP32-H2 radio; BLE is only active when requested:
+
+- **BLE update mode** (EP10 or the page below): Zigbee is not started, the device advertises as `SmartSwitch-XXXX` for 10 minutes and accepts a firmware image from `tools/ble_update.html`. The page can also erase the Zigbee credentials
+- **BLE log** (EP13): the device keeps working on Zigbee and streams its log lines live to `tools/ble_log.html` (device name `SmartLog-XXXX`). Turn it off with EP13 or a short press of the BOOT button
+
+Both pages use Web Bluetooth: open them in **Chrome or Edge** (desktop or Android), directly from the file.
+
+### Serial commands
+
+On the serial console (115200 baud): `prog` = restart in download mode, `reset` = normal restart, `help`.
 
 ---
 
@@ -160,9 +201,9 @@ NVS configuration survives firmware OTA updates. Re-running `configure.py` and r
 | Task | Tool required |
 |------|---------------|
 | Generate `nvs_config.bin` | Python 3 (no ESP-IDF needed) |
-| Flash pre-built binaries | [esptool.py](https://github.com/espressif/esptool) |
-| Build firmware from source | [ESP-IDF v5.1.2](https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32h2/get-started/index.html) |
-| Generate OTA image | Python 3 (no ESP-IDF needed) |
+| Flash pre-built binaries | [esptool](https://github.com/espressif/esptool) (standalone release or `pip install esptool`) + a 3.3 V USB-serial adapter |
+| Build firmware from source | [ESP-IDF v5.5.6](https://docs.espressif.com/projects/esp-idf/en/v5.5.6/esp32h2/get-started/index.html) |
+| Firmware update over the air | Chrome or Edge with Bluetooth (`tools/ble_update.html`) |
 
 ---
 
@@ -190,67 +231,67 @@ Output files (generated in the same folder as `configure.py`):
 
 ### Step 2a — Flash pre-built binaries
 
-Use this method if you do **not** need to build from source.
+Use this method if you do **not** need to build from source. Check the files against `binaries/SHA256SUMS.txt`.
+
+**Enter download mode**: disconnect mains power, then power the board from the USB-serial adapter while GPIO 9 is held low (on PCB A: jumper on **H1**, then connect +5V/GND/TX/RX of the 4-pin header). Remove the jumper and power-cycle the board after flashing.
+
+Full programming (erases everything, the device must be paired in ZHA afterwards):
 
 ```cmd
-esptool.py --chip esp32h2 --port COM12 --baud 460800 write_flash --flash_mode dio --flash_freq 48m --flash_size 4MB 0x0000 binaries/bootloader.bin 0x8000 binaries/partition-table.bin 0x9000 nvs_config.bin 0x10000 binaries/ota_data_initial.bin 0x20000 binaries/smart_switch.bin
+esptool --chip esp32h2 --port COM12 --baud 460800 --before no-reset --after no-reset erase-flash
+esptool --chip esp32h2 --port COM12 --baud 460800 --before no-reset --after no-reset write-flash --flash-mode dio --flash-freq 48m --flash-size 4MB 0x0 binaries/bootloader.bin 0x8000 binaries/partition-table.bin 0x9000 nvs_config.bin 0x10000 binaries/ota_data_initial.bin 0x20000 binaries/smart_switch.bin
 ```
 
-Replace `COM12` with your actual port (`/dev/ttyUSBx` on Linux/macOS).  
-Flash `nvs_config.bin` alone to update the configuration without touching the firmware:
+Replace `COM12` with your actual port (`/dev/ttyUSBx` on Linux/macOS). With esptool v4 use `esptool.py` and underscores (`erase_flash`, `write_flash`, `--flash_mode`…).
+
+Flash `nvs_config.bin` alone to change the configuration (this also erases the Zigbee pairing):
 
 ```cmd
-esptool.py --port COM12 write_flash 0x9000 nvs_config.bin
+esptool --chip esp32h2 --port COM12 --before no-reset --after no-reset write-flash 0x9000 nvs_config.bin
 ```
 
 ---
 
 ### Step 2b — Build from source (optional)
 
-Requires ESP-IDF v5.1.2. Run the following from the **ESP-IDF terminal**:
+Requires ESP-IDF v5.5.6. Run the following from the **ESP-IDF terminal**:
 
 ```cmd
 cd firmware
 idf.py set-target esp32h2
 idf.py build
 idf.py flash
-esptool.py --port COM12 write_flash 0x9000 nvs_config.bin
+esptool --chip esp32h2 --port COM12 write-flash 0x9000 nvs_config.bin
 ```
 
-> `idf.py flash` writes the firmware to the OTA slot (`0x20000`) but does **not** touch the NVS partition, so `nvs_config.bin` must be flashed separately.
+> `idf.py flash` writes bootloader, partition table and firmware but does **not** touch the NVS partition, so `nvs_config.bin` must be flashed separately on a new device.
 
 ---
 
-### Step 3 — OTA firmware update
+## Firmware updates
 
-OTA updates replace the firmware without touching the NVS configuration.
+### Over Bluetooth LE (recommended)
 
-**3a. Bump the firmware version**
+1. In Home Assistant turn on the **BLE** switch (EP10): the device restarts in BLE update mode (LED slow blink).
+2. Open `tools/ble_update.html` in Chrome/Edge, choose `smart_switch.bin`, leave *"Erase the Zigbee credentials"* unchecked.
+3. Press **Find device and send** and select `SmartSwitch-XXXX`.
+4. The device checks the image, restarts with the new firmware and rejoins the network by itself.
 
-Edit `firmware/main/ota.h` and increment `OTA_FILE_VERSION`:
+If nothing is sent within 10 minutes the device restarts in normal mode.
 
-```c
-/* Format: 0xMMNNPPPP — MM=major, NN=minor, PPPP=patch (16-bit) */
-#define OTA_FILE_VERSION  0x01060200   /* e.g. v1.6.2 */
-#define OTA_SW_BUILD_ID   "\x06""v1.6.2"
-```
+### By cable
 
-**3b. Build and package the OTA image**
+See Step 2a / 2b.
 
-```cmd
-idf.py build
-python make_ota.py firmware
-```
+### Zigbee OTA
 
-This generates `smart_switch-vX.Y.Z.ota` in the same folder as `make_ota.py`.
+Removed in v2.0.0: the 1.x compatibility layer of esp-zigbee-lib 2.x does not provide the OTA cluster. `make_ota.py` is kept for building OTA images of **v1.x** firmware only.
 
-**3c. Distribute via ZHA (Home Assistant)**
+### Upgrading from v1.x
 
-1. Copy the `.ota` file to your ZHA OTA folder (usually `config/custom_components/zha/ota/` or as configured in `configuration.yaml`).
-2. Restart Home Assistant (or reload the ZHA integration).
-3. In ZHA → Device → Update, the new firmware will appear. Trigger the update from there.
+- From a v1.x build with BLE update: update over BLE as above. On the first boot v2.0.0 migrates the Zigbee network data from the old `zb_storage` partition (`esp_zigbee_nvram_migrate()`), so the device **stays paired** (tested from v1.6.11). After the update press **Reconfigure** in ZHA if states stop updating.
+- From v1.6.2 or older (no BLE update): flash by cable (Step 2a) and pair the device again.
 
 ---
-
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.

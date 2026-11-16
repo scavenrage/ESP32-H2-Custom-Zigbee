@@ -24,15 +24,23 @@
 #include "relay.h"
 #include "shutter.h"
 #include "dimmer.h"
+#include "diag.h"
+#include "ble_update.h"
+#include "maint.h"
+#include "ble_log.h"
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_zigbee_core.h"
+#include "esp_zigbee_core.h"   /* ZB2: header di compatibilità 1.x (CONFIG_ZB_SDK_1xx) */
 #include "esp_zigbee_cluster.h"
+#if ZB_OTA_ENABLED
+/* ZB2: in 2.0.5 questo header ridefinisce esp_zb_ota_file_header_t / _optional_t già
+ * definiti in compat/zcl/esp_zigbee_zcl_command.h: non si possono includere entrambi. */
 #include "esp_zigbee_ota.h"
+#endif
 #include "ha/esp_zigbee_ha_standard.h"
 #include "zdo/esp_zigbee_zdo_command.h"
 #include "esp_partition.h"
@@ -45,7 +53,7 @@ static const char *TAG = "MAIN";
 /* ── Configurazione Zigbee ───────────────────────────────────────────── */
 #define INSTALLCODE_POLICY_ENABLE    false
 #define MAX_CHILDREN                 10
-#define ESP_ZB_PRIMARY_CHANNEL_MASK  (1UL << 25)   /* canale fisso 25 */
+#define ESP_ZB_PRIMARY_CHANNEL_MASK  ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK   /* canali 11-26: si associa al coordinatore su qualunque canale (come Altherma/ConsoleZ906) */
 #define OTA_UPGRADE_QUERY_INTERVAL   240   /* minuti */
 
 #define ESP_MANUFACTURER_NAME  "\x09""Handmade!"
@@ -65,7 +73,15 @@ static uint8_t s_ep_to_type[5];
 static uint8_t s_ch_to_ep[4];    /* ch 0..3 → ep */
 static uint8_t s_ota_ep = 1;
 
-static bool zigbee_ready             = false;
+/* Endpoint On/Off "virtuali" (nessun relay collegato): On = azione di manutenzione dopo 1.5 s.
+ * Numeri fissi fuori dal range dei canali (ep 1..4); non sono nelle tabelle s_ep_to_*. */
+#define BLE_SWITCH_EP      10   /* riavvia in modalità aggiornamento BLE */
+#define PROG_SWITCH_EP     11   /* riavvia in modalità programmazione (download seriale) */
+#define FACTORY_SWITCH_EP  12   /* factory reset Zigbee (come BOOT premuto 5 s) */
+#define LOG_SWITCH_EP      13   /* log via BLE: ON/OFF (stato salvato in NVS, riavvia) */
+#define IS_VIRTUAL_EP(ep)  ((ep) >= BLE_SWITCH_EP)
+
+static bool zigbee_ready            = false;
 static bool s_coordinator_confirmed  = false;   /* true solo dopo ping ZDO riuscito */
 static uint8_t s_ping_tick           = 0;
 static uint8_t s_ping_fail_count     = 0;       /* fallimenti ZDO consecutivi       */
@@ -82,7 +98,7 @@ static uint8_t s_steering_fail_count = 0;       /* fallimenti steering consecuti
  * Se il coordinator non risponde per COORDINATOR_PING_MAX_FAILS cicli
  * consecutivi (≈ 4-5 min), il dispositivo è definitivamente disconnesso
  * (tipicamente per interferenze RF) → zigbee_hard_reset(): cancella
- * zb_storage/zb_fct e riavvia per un join pulito.
+ * credenziali (NVS "zigbee" + zb_fct) e riavvia per un join pulito.
  *
  * COORDINATOR_PING_TIMEOUT_MS: timeout di sicurezza per il caso in cui
  * la callback ZDO non venga mai chiamata (route error anziché ZDP timeout).
@@ -116,9 +132,13 @@ static void init_ep_map(void)
 /* ── OTA ─────────────────────────────────────────────────────────────── */
 static void ota_find_server(void)
 {
+#if ZB_OTA_ENABLED
     esp_zb_ota_upgrade_client_query_interval_set(s_ota_ep, OTA_UPGRADE_QUERY_INTERVAL);
     esp_zb_ota_upgrade_client_query_image_req(0x0000, 1);
     ESP_LOGI(TAG, "OTA: query → coordinator, polling ogni %d min", OTA_UPGRADE_QUERY_INTERVAL);
+#else
+    ESP_LOGI(TAG, "OTA Zigbee disattivato in questa build (ZB2): aggiornamenti via BLE o cavo");
+#endif
 }
 
 /* ── Zigbee hard reset (disconnessione definitiva) ───────────────────── */
@@ -127,7 +147,7 @@ static void ota_find_server(void)
  * e i normali meccanismi di steering non bastano (tipicamente: interferenze RF
  * che corrompono lo stato dello stack Zigbee).
  *
- * Cancella zb_storage e zb_fct → al prossimo avvio lo stack riparte da zero
+ * Cancella le credenziali (NVS "zigbee" + zb_fct, ZB2) → al prossimo avvio lo stack riparte da zero
  * e fa un join pulito. La configurazione NVS (sw_cfg, relay, shutter, dimmer)
  * rimane intatta.
  *
@@ -137,27 +157,18 @@ static void ota_find_server(void)
  */
 static void zigbee_hard_reset(const char *reason)
 {
-    ESP_LOGW(TAG, "*** ZIGBEE HARD RESET (%s) — cancello partizioni Zigbee ***", reason);
+    ESP_LOGW(TAG, "*** ZIGBEE HARD RESET (%s) — cancello credenziali Zigbee ***", reason);
     led_set_state(LED_ERROR);
-    const char *zb_parts[] = { "zb_storage", "zb_fct", "phy_init" };
-    for (int i = 0; i < 3; i++) {
-        const esp_partition_t *p = esp_partition_find_first(
-            ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, zb_parts[i]);
-        if (p) {
-            esp_err_t err = esp_partition_erase_range(p, 0, p->size);
-            ESP_LOGW(TAG, "  '%s' (0x%"PRIx32", %"PRIu32"B): %s",
-                     zb_parts[i], p->address, p->size,
-                     err == ESP_OK ? "OK" : esp_err_to_name(err));
-        } else {
-            ESP_LOGE(TAG, "  '%s': partizione non trovata!", zb_parts[i]);
-        }
-    }
-    vTaskDelay(pdMS_TO_TICKS(200));
+    /* ZB2: causa scritta prima della cancellazione, così tra cancellazione e riavvio passa
+     * il minimo tempo (lo stack Zigbee è ancora attivo e potrebbe riscrivere in NVS). */
+    diag_set_restart_cause(DIAG_CAUSE_HARD_RESET);
+    maint_erase_zigbee_credentials(true);
+    vTaskDelay(pdMS_TO_TICKS(50));
     esp_restart();
 }
 
 /* Cancella solo la calibrazione PHY e riavvia.
- * zb_storage/zb_fct restano intatti: al prossimo avvio il device
+ * le credenziali (NVS "zigbee" + zb_fct) restano intatte: al prossimo avvio il device
  * ricalibra il radio da zero e fa un rejoin con le credenziali esistenti.
  * Non richiede permit join sul coordinator. */
 static void zigbee_phy_reset(const char *reason)
@@ -174,6 +185,7 @@ static void zigbee_phy_reset(const char *reason)
     } else {
         ESP_LOGE(TAG, "  'phy_init': partizione non trovata!");
     }
+    diag_set_restart_cause(DIAG_CAUSE_PHY_RESET);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
 }
@@ -188,7 +200,32 @@ static void zigbee_phy_reset(const char *reason)
  * sul QueueSet interno dello stack Zigbee → crash in prvNotifyQueueSetContainer.
  *
  * Tutte le callback hardware usano quindi esp_zb_scheduler_alarm.
+ *
+ * ZB2 (esp-zigbee-lib 2.x): la regola sopra valeva per la 1.x/ZBOSS. In 2.x esp_zigbee.h dice:
+ * "It's mandatory to acquire the lock before calling any Zigbee SDK APIs, except that the call
+ * site is in Zigbee callbacks." Senza lock, gli allarmi programmati dai task degli ingressi/timer
+ * facevano sparire altri allarmi (watchdog, keepalive): visto l'11/11/2026 sul modulo di sviluppo
+ * mentre si usavano i tasti fisici. Le callback hardware passano quindi da zb_alarm_any_task():
+ * dal task Zigbee chiamata diretta, da altri task con il lock.
  */
+
+static TaskHandle_t s_zb_task = NULL;   /* task Zigbee_main, impostato in esp_zb_task() */
+
+static void zb_alarm_any_task(esp_zb_callback_t cb, uint8_t param, uint32_t ms)
+{
+    if (s_zb_task != NULL && xTaskGetCurrentTaskHandle() == s_zb_task) {
+        /* Già nel task Zigbee (es. dimmer comandato da Zigbee): niente lock, potrebbe non essere rientrante */
+        esp_zb_scheduler_alarm(cb, param, ms);
+        return;
+    }
+    /* Attesa limitata: alcune chiamate arrivano dal task dei timer FreeRTOS, che non va bloccato a lungo */
+    if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+        esp_zb_scheduler_alarm(cb, param, ms);
+        esp_zb_lock_release();
+    } else {
+        ESP_LOGW(TAG, "lock Zigbee non ottenuto in 1 s: aggiornamento verso HA saltato (lo recupera il keepalive)");
+    }
+}
 
 /* ── Relay → Zigbee (via scheduler_alarm) ──────────────────────────── */
 /* Codifica parametro: bit7=stato, bit0..6=canale */
@@ -209,7 +246,7 @@ static void on_relay_changed(uint8_t ch, bool state)
 {
     if (!zigbee_ready) return;
     uint8_t param = (ch & 0x7F) | (state ? 0x80 : 0x00);
-    esp_zb_scheduler_alarm(do_relay_zigbee_sync, param, 0);
+    zb_alarm_any_task(do_relay_zigbee_sync, param, 0);   /* ZB2: chiamata da task ingressi / timer impulso */
 }
 
 /* ── Shutter → Zigbee (via scheduler_alarm) ────────────────────────── */
@@ -224,12 +261,31 @@ static void do_shutter_zigbee_sync(uint8_t param)
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE_ID,
         &pos, false);
+
+    /* ZB2: a movimento finito (fine corsa o STOP) report esplicito della posizione al coordinator.
+     * In esp-zigbee-lib 2.x reportable_change=N vale "variazione > N" (esp-zigbee-sdk issue #903,
+     * risposta Espressif); ZHA configura N=1, quindi l'ultimo passo di 1 punto (es. 1→0) non
+     * generava report e HA restava a 99% fino al report periodico (max 900 s). Con 1.x non succedeva.
+     * Siamo nel contesto Zigbee (scheduler alarm): niente lock. */
+    if (!shutter_is_moving(ch)) {
+        esp_zb_zcl_report_attr_cmd_t cmd = {0};
+        cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+        cmd.zcl_basic_cmd.dst_endpoint = 1;
+        cmd.zcl_basic_cmd.src_endpoint = ep;
+        cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_WINDOW_COVERING;
+        cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+        cmd.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+        cmd.attributeID = ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE_ID;
+        esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
+        ESP_LOGI(TAG, "EP%d: report posizione finale %d%%: %s", ep, pos, esp_err_to_name(err));
+    }
 }
 
 static void on_shutter_changed(uint8_t ch, uint8_t pos)
 {
     if (!zigbee_ready) return;
-    esp_zb_scheduler_alarm(do_shutter_zigbee_sync, ch, 0);
+    zb_alarm_any_task(do_shutter_zigbee_sync, ch, 0);    /* ZB2: chiamata da task ingressi / timer tapparella */
 }
 
 /* ── Dimmer → Zigbee (via scheduler_alarm) ─────────────────────────── */
@@ -261,7 +317,7 @@ static void on_dimmer_changed(bool on_off, uint8_t level)
     if (!zigbee_ready) return;
     s_dimmer_pending_on    = on_off;
     s_dimmer_pending_level = level;
-    esp_zb_scheduler_alarm(do_dimmer_zigbee_sync, 0, 0);
+    zb_alarm_any_task(do_dimmer_zigbee_sync, 0, 0);      /* ZB2: task pulsante oppure task Zigbee */
 }
 
 /* ── Costruzione cluster Basic ───────────────────────────────────────── */
@@ -276,6 +332,14 @@ static esp_zb_attribute_list_t *create_basic_cluster(void)
     esp_zb_basic_cluster_add_attr(c, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,  ESP_MODEL_IDENTIFIER);
     esp_zb_basic_cluster_add_attr(c, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID,          OTA_SW_BUILD_ID);
     return c;
+}
+
+/* Cluster diagnostico (solo sull'endpoint che ospita anche l'OTA) */
+static void add_diag_cluster(esp_zb_cluster_list_t *cl)
+{
+    esp_zb_attribute_list_t *d = diag_zb_cluster_create();
+    if (d)
+        esp_zb_cluster_list_add_custom_cluster(cl, d, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 }
 
 /* ── Costruzione endpoint On/Off (relay) ─────────────────────────────── */
@@ -295,9 +359,13 @@ static void add_relay_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep, uint8_t ch
     esp_zb_cluster_list_add_on_off_cluster(cl,
         esp_zb_on_off_cluster_create(&oo), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    if (ep == s_ota_ep)
+    if (ep == s_ota_ep) {
+#if ZB_OTA_ENABLED
         esp_zb_cluster_list_add_ota_cluster(cl,
             ota_cluster_create(), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+#endif
+        add_diag_cluster(cl);
+    }
 
     esp_zb_endpoint_config_t epcfg = {
         .endpoint           = ep,
@@ -307,6 +375,29 @@ static void add_relay_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep, uint8_t ch
     };
     esp_zb_ep_list_add_ep(ep_list, cl, epcfg);
     ESP_LOGI(TAG, "EP%d: On/Off relay (CH%d)", ep, ch);
+}
+
+/* ── Endpoint virtuali di manutenzione ────────────────────────────────── */
+static void add_virtual_switch_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep, const char *what,
+                                        bool initial_on)
+{
+    esp_zb_cluster_list_t *cl = esp_zb_zcl_cluster_list_create();
+
+    esp_zb_cluster_list_add_basic_cluster(cl, create_basic_cluster(),
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_on_off_cluster_cfg_t oo = { .on_off = initial_on ? 1 : 0 };
+    esp_zb_cluster_list_add_on_off_cluster(cl,
+        esp_zb_on_off_cluster_create(&oo), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_endpoint_config_t epcfg = {
+        .endpoint           = ep,
+        .app_profile_id     = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id      = ESP_ZB_HA_ON_OFF_OUTPUT_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, cl, epcfg);
+    ESP_LOGI(TAG, "EP%d: interruttore virtuale %s", ep, what);
 }
 
 /* ── Costruzione endpoint Window Covering (tapparella) ───────────────── */
@@ -327,9 +418,13 @@ static void add_shutter_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep, uint8_t 
     esp_zb_window_covering_cluster_add_attr(wc,
         ESP_ZB_ZCL_ATTR_WINDOW_COVERING_CURRENT_POSITION_LIFT_PERCENTAGE_ID, &pos);
 
-    if (ep == s_ota_ep)
+    if (ep == s_ota_ep) {
+#if ZB_OTA_ENABLED
         esp_zb_cluster_list_add_ota_cluster(cl,
             ota_cluster_create(), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+#endif
+        add_diag_cluster(cl);
+    }
 
     esp_zb_endpoint_config_t epcfg = {
         .endpoint           = ep,
@@ -370,7 +465,11 @@ static void add_dimmer_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep)
     esp_zb_cluster_list_add_on_off_cluster(cl,   on_off_cl,   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_level_cluster(cl,    level_cl,    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
+#if ZB_OTA_ENABLED
     esp_zb_cluster_list_add_ota_cluster(cl, ota_cluster_create(), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+#endif
+    if (ep == s_ota_ep)
+        add_diag_cluster(cl);
 
     esp_zb_endpoint_config_t epcfg = {
         .endpoint           = ep,
@@ -403,13 +502,109 @@ static void create_endpoints(esp_zb_ep_list_t *ep_list)
             break;
         }
     }
+    add_virtual_switch_endpoint(ep_list, BLE_SWITCH_EP,     "aggiornamento BLE",       false);
+    add_virtual_switch_endpoint(ep_list, PROG_SWITCH_EP,    "modalità programmazione", false);
+    add_virtual_switch_endpoint(ep_list, FACTORY_SWITCH_EP, "factory reset Zigbee",    false);
+    add_virtual_switch_endpoint(ep_list, LOG_SWITCH_EP,     "log via BLE",             ble_log_enabled());
 }
 
 /* ── Handler comandi Zigbee ──────────────────────────────────────────── */
 
+/* Factory reset Zigbee: cancella le partizioni Zigbee e riavvia. Non ritorna.
+ * Cancelliamo direttamente le credenziali (NVS "zigbee" + zb_fct, ZB2) senza passare
+ * dallo stack Zigbee (che richiederebbe il suo task). La configurazione NVS resta intatta. */
+static void zigbee_factory_reset_and_restart(void)
+{
+    ESP_LOGW(TAG, "*** FACTORY RESET ZIGBEE — cancello credenziali... ***");
+    /* ZB2: causa scritta prima, cancellazione subito prima del riavvio (vedi zigbee_hard_reset) */
+    diag_set_restart_cause(DIAG_CAUSE_FACTORY);
+    maint_erase_zigbee_credentials(false);
+    ESP_LOGW(TAG, "Riavvio...");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_restart();
+}
+
+/* L'azione parte da un task a parte, così la risposta Zigbee al comando fa in tempo a partire. */
+typedef void (*maint_action_t)(void);
+
+static void maint_action_task(void *pv)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ((maint_action_t)pv)();
+    vTaskDelete(NULL);
+}
+
+static void log_switch_task(void *pv)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ble_log_set_enabled_and_restart((bool)(uintptr_t)pv);
+    vTaskDelete(NULL);
+}
+
+/* Report singolo On/Off degli EP virtuali verso il coordinator (0x0000, endpoint 1 di ZHA), come
+ * diag_zb_report_to_coordinator: senza, dopo un riavvio HA continua a mostrare l'ultimo valore
+ * (es. EP10 ON dopo l'aggiornamento BLE), perché l'attributo riparte al valore di creazione
+ * (OFF, EP13 = stato del log BLE) senza nessuna variazione che generi un report.
+ * Chiamato dalla callback del ping (contesto Zigbee): niente lock. */
+static void report_virtual_switches(void)
+{
+    static const uint8_t eps[] = { BLE_SWITCH_EP, PROG_SWITCH_EP, FACTORY_SWITCH_EP, LOG_SWITCH_EP };
+    for (size_t i = 0; i < sizeof(eps); i++) {
+        esp_zb_zcl_report_attr_cmd_t cmd = {0};
+        cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+        cmd.zcl_basic_cmd.dst_endpoint = 1;
+        cmd.zcl_basic_cmd.src_endpoint = eps[i];
+        cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+        cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+        cmd.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+        cmd.attributeID = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
+        esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
+        ESP_LOGI(TAG, "EP%d: report stato interruttore virtuale: %s", eps[i], esp_err_to_name(err));
+    }
+}
+
+static esp_err_t handle_virtual_switch(const esp_zb_zcl_set_attr_value_message_t *msg)
+{
+    static bool requested = false;
+    if (msg->info.cluster != ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) return ESP_OK;
+    if (msg->attribute.id != ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) return ESP_OK;
+    if (msg->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_BOOL) return ESP_OK;
+    if (requested) return ESP_OK;
+    const bool on = *(bool *)msg->attribute.data.value;
+
+    /* Il log via BLE si attiva e si disattiva; gli altri reagiscono solo a ON. */
+    if (msg->info.dst_endpoint == LOG_SWITCH_EP) {
+        if (on == ble_log_enabled()) return ESP_OK;
+        requested = true;
+        ESP_LOGW(TAG, "Zigbee: log via BLE %s — riavvio tra 1.5 s", on ? "ON" : "OFF");
+        xTaskCreate(log_switch_task, "log_sw", 4096, (void *)(uintptr_t)on, 5, NULL);
+        return ESP_OK;
+    }
+    if (!on) return ESP_OK;
+
+    maint_action_t action;
+    const char *what;
+    switch (msg->info.dst_endpoint) {
+    case BLE_SWITCH_EP:
+        action = ble_update_request_and_restart; what = "modalità aggiornamento BLE"; break;
+    case PROG_SWITCH_EP:
+        action = maint_enter_download_mode;      what = "modalità programmazione";    break;
+    case FACTORY_SWITCH_EP:
+        action = zigbee_factory_reset_and_restart; what = "factory reset Zigbee";     break;
+    default:
+        return ESP_OK;
+    }
+    requested = true;
+    ESP_LOGW(TAG, "Zigbee: richiesta %s — avvio tra 1.5 s", what);
+    xTaskCreate(maint_action_task, "maint_act", 4096, action, 5, NULL);
+    return ESP_OK;
+}
+
 static esp_err_t handle_on_off(const esp_zb_zcl_set_attr_value_message_t *msg)
 {
     uint8_t ep  = msg->info.dst_endpoint;
+    if (IS_VIRTUAL_EP(ep)) return handle_virtual_switch(msg);   /* prima di indicizzare s_ep_to_* */
     uint8_t ch  = s_ep_to_ch[ep];
     uint8_t typ = s_ep_to_type[ep];
     if (ch == 0xFF) return ESP_OK;
@@ -481,6 +676,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t cb_id, const
         return zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)msg);
     case ESP_ZB_CORE_WINDOW_COVERING_MOVEMENT_CB_ID:
         return handle_window_covering((esp_zb_zcl_window_covering_movement_message_t *)msg);
+#if ZB_OTA_ENABLED
     case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID: {
         const esp_zb_zcl_ota_upgrade_value_message_t *ota =
             (esp_zb_zcl_ota_upgrade_value_message_t *)msg;
@@ -497,6 +693,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t cb_id, const
             ESP_LOGI(TAG, "OTA: nessuna nuova immagine (0x%02x)", r->query_status);
         return ESP_OK;
     }
+#endif
     case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
         return ESP_OK;
     default:
@@ -540,6 +737,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
         break;
 
     case ESP_ZB_ZDO_SIGNAL_LEAVE:
+        diag_event(DIAG_EVT_LEAVE);
         zigbee_ready            = false;
         s_coordinator_confirmed = false;
         ESP_LOGW(TAG, "Segnale LEAVE ricevuto — riprovo steering tra 30s...");
@@ -565,14 +763,18 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             /* LED rimane in SEARCHING: diventa operativo solo dopo che il ping ZDO
              * al coordinator ha avuto risposta (in coordinator_ping_result). */
             s_ping_tick = COORDINATOR_PING_TICKS - 1;   /* prossimo tick → ping subito */
+            /* ZB2: unico punto di avvio del keepalive. Annulla un eventuale tick già in coda,
+             * altrimenti in 2.x le catene si sommano (viste due catene, ping ogni ~2,5 min). */
+            esp_zb_scheduler_alarm_cancel(coordinator_ping_cb, 0);
             esp_zb_scheduler_alarm(coordinator_ping_cb, 0, 1000);
         } else {
             s_steering_fail_count++;
+            diag_event(DIAG_EVT_STEERING_FAIL);
             ESP_LOGW(TAG, "Steering fallito (%d/%d), riprovo tra 30s...",
                      s_steering_fail_count, STEERING_MAX_FAILS);
             if (s_steering_fail_count >= STEERING_MAX_FAILS) {
                 /* Calibrazione PHY probabilmente corrotta (interferenza RF).
-                 * PHY reset: cancella phy_init e riavvia — zb_storage intatta,
+                 * PHY reset: cancella phy_init e riavvia — credenziali intatte,
                  * il device farà un rejoin senza permit join. */
                 zigbee_phy_reset("steering loop");
             }
@@ -582,6 +784,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
         break;
 
     case ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
+        diag_event(DIAG_EVT_NO_LINKS);
         if (zigbee_ready) {   /* guard: evita scheduling multiplo */
             zigbee_ready            = false;
             s_coordinator_confirmed = false;
@@ -638,6 +841,10 @@ static void coordinator_ping_result(esp_zb_zdp_status_t zdo_status,
             ESP_LOGI(TAG, "Coordinator raggiungibile — operativo");
             led_set_state(LED_OPERATIONAL);
             ota_find_server();
+            /* Dice a Home Assistant quanti riavvii anomali ci sono stati (allarme). */
+            diag_zb_report_to_coordinator(s_ota_ep);
+            /* Stato reale degli interruttori virtuali EP10-13 (dopo un riavvio HA mostrava l'ultimo). */
+            report_virtual_switches();
         }
 
         /* Sync attributi con report=true: aggiorna ZHA e stimola route discovery.
@@ -669,6 +876,7 @@ static void coordinator_ping_result(esp_zb_zdp_status_t zdo_status,
     } else {
         /* Coordinator non raggiungibile */
         s_ping_fail_count++;
+        diag_event(DIAG_EVT_PING_FAIL);
         ESP_LOGW(TAG, "Coordinator irraggiungibile (0x%02x) — fail %d/%d",
                  zdo_status, s_ping_fail_count, COORDINATOR_PING_MAX_FAILS);
         zigbee_ready            = false;
@@ -748,6 +956,7 @@ static void zb_wdt_feed_cb(uint8_t param)
 {
     (void)param;
     s_zb_last_feed = xTaskGetTickCount();
+    diag_zb_update(s_ota_ep);
     esp_zb_scheduler_alarm(zb_wdt_feed_cb, 0, ZB_WDT_FEED_INTERVAL_MS);
 }
 
@@ -762,6 +971,7 @@ static void zb_watchdog_task(void *pv)
         if (elapsed > pdMS_TO_TICKS(ZB_WDT_TIMEOUT_MS)) {
             ESP_LOGE("ZB_WDT", "Stack Zigbee non risponde da %lu s — deep sleep 3s",
                      (unsigned long)(elapsed * portTICK_PERIOD_MS / 1000));
+            diag_set_restart_cause(DIAG_CAUSE_ZB_WDT);
             vTaskDelay(pdMS_TO_TICKS(100));
             esp_sleep_enable_timer_wakeup(3ULL * 1000 * 1000);
             esp_deep_sleep_start();
@@ -810,46 +1020,36 @@ static void factory_reset_task(void *pv)
         led_set_state(LED_FACTORY_RESET);
 
         bool held = true;
+        int held_ticks = 0;
         for (int i = 0; i < FACTORY_RESET_HOLD_S * 10; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
             if (gpio_get_level(FACTORY_RESET_GPIO) != 0) {
                 held = false;
+                held_ticks = i + 1;
                 break;
             }
         }
 
         if (!held) {
+            /* Pressione breve (0.3 s - 5 s) con il log via BLE attivo: lo disattiva e riavvia. */
+            if (held_ticks >= 3 && ble_log_enabled()) {
+                ESP_LOGW(TAG, "GPIO9: pressione breve — disattivo il log via BLE");
+                ble_log_set_enabled_and_restart(false);
+            }
             ESP_LOGI(TAG, "GPIO9 rilasciato — annullato");
             led_set_state(zigbee_ready ? LED_OPERATIONAL : LED_ZIGBEE_SEARCHING);
             continue;
         }
 
-        /* Tenuto abbastanza — cancella partizioni Zigbee e riavvia.
-         * Cancelliamo direttamente le partizioni flash zb_storage e zb_fct
-         * senza passare dallo stack Zigbee (che richiederebbe il suo task). */
-        ESP_LOGW(TAG, "*** FACTORY RESET ZIGBEE — cancello partizioni... ***");
-        const char *zb_parts[] = { "zb_storage", "zb_fct" };
-        for (int i = 0; i < 2; i++) {
-            const esp_partition_t *p = esp_partition_find_first(
-                ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, zb_parts[i]);
-            if (p) {
-                esp_err_t err = esp_partition_erase_range(p, 0, p->size);
-                ESP_LOGW(TAG, "Partizione '%s' (0x%"PRIx32", %"PRIu32" byte): %s",
-                         zb_parts[i], p->address, p->size,
-                         err == ESP_OK ? "CANCELLATA" : esp_err_to_name(err));
-            } else {
-                ESP_LOGE(TAG, "Partizione '%s' NON TROVATA!", zb_parts[i]);
-            }
-        }
-        ESP_LOGW(TAG, "Riavvio...");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        esp_restart();
+        /* Tenuto abbastanza — factory reset Zigbee e riavvio */
+        zigbee_factory_reset_and_restart();
     }
 }
 
 /* ── Task Zigbee ─────────────────────────────────────────────────────── */
 static void esp_zb_task(void *pv)
 {
+    s_zb_task = xTaskGetCurrentTaskHandle();   /* ZB2: per zb_alarm_any_task() */
     esp_zb_cfg_t cfg = ESP_ZB_ZR_CONFIG();
     esp_zb_init(&cfg);
 
@@ -866,13 +1066,37 @@ static void esp_zb_task(void *pv)
     s_zb_last_feed = xTaskGetTickCount();
     esp_zb_scheduler_alarm(zb_wdt_feed_cb, 0, ZB_WDT_FEED_INTERVAL_MS);
 
-    /* Avvia il keepalive ZDO verso il coordinator (island detection) */
-    esp_zb_scheduler_alarm(coordinator_ping_cb, 0, COORDINATOR_PING_TICK_MS);
+    /* ZB2: il keepalive ZDO verso il coordinator (island detection) parte solo quando il
+     * dispositivo entra in rete (ESP_ZB_BDB_SIGNAL_STEERING riuscito), non più anche qui. */
 
     esp_zb_stack_main_loop();
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────── */
+/* ZB2: migrazione una tantum dei dati Zigbee 1.x (zb_storage, FAT) → 2.x (nvs, namespace "zigbee").
+ * Come l'esempio Espressif examples/nvram_migration: dopo nvs_flash_init, prima dell'avvio dello stack.
+ * La libreria non tocca zb_storage; il marcatore "zb2_mig/done" evita di ripeterla.
+ * Diverso dall'esempio: un solo tentativo, riuscito o no, e nessun blocco dell'avvio se fallisce
+ * (il valore restituito con zb_storage vuota, cioè modulo flashato da zero, non è documentato). */
+static void zb2_migrate_legacy_nvram(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("zb2_mig", NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "migrazione 1.x: nvs_open fallito, salto");
+        return;
+    }
+    uint8_t done = 0;
+    if (nvs_get_u8(h, "done", &done) == ESP_OK) {
+        nvs_close(h);
+        return;                                       /* già fatta */
+    }
+    esp_err_t err = esp_zigbee_nvram_migrate(NULL);   /* default: zb_storage → nvs, IEEE = MAC */
+    ESP_LOGW(TAG, "migrazione dati Zigbee 1.x → 2.x: %s", esp_err_to_name(err));
+    nvs_set_u8(h, "done", 1);                         /* un solo tentativo, riuscito o no */
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 void app_main(void)
 {
     /* ── Controllo reset reason ──────────────────────────────────────────
@@ -883,24 +1107,46 @@ void app_main(void)
      * In quel caso forziamo un deep sleep di 3s: il wakeup è equivalente a
      * un power cycle (rst:0x5 DEEPSLEEP) e garantisce la reinizializzazione
      * completa del radio prima di tentare qualsiasi connessione Zigbee. */
+    /* NVS prima del controllo: la diagnostica deve registrare il motivo del reset
+     * prima dell'eventuale deep sleep di recupero. */
+    ESP_ERROR_CHECK(nvs_flash_init());
+    /* ZB2: esp-zigbee-lib 2.0.5 salva i dati Zigbee nella partizione "nvs" (namespace "zigbee"),
+     * già inizializzata qui sopra. zb_storage resta FAT come in 1.x e non viene usata dallo stack. */
+
     {
         esp_reset_reason_t rr = esp_reset_reason();
+        diag_boot(rr);
         if (rr != ESP_RST_POWERON &&
             rr != ESP_RST_DEEPSLEEP &&
             rr != ESP_RST_EXT) {
-            ESP_LOGW(TAG, "Reset non-pulito (reason=%d) — deep sleep 3s per reset radio", (int)rr);
-            esp_sleep_enable_timer_wakeup(3ULL * 1000 * 1000);
-            esp_deep_sleep_start();
+            if (diag_restart_was_commanded()) {
+                /* Riavvio deciso dall'utente (OTA, BLE, factory reset): avvio normale. */
+                ESP_LOGI(TAG, "Riavvio comandato (reason=%d) — avvio normale, niente deep sleep", (int)rr);
+            } else {
+                ESP_LOGW(TAG, "Reset non-pulito (reason=%d) — deep sleep 3s per reset radio", (int)rr);
+                esp_sleep_enable_timer_wakeup(3ULL * 1000 * 1000);
+                esp_deep_sleep_start();
+            }
         }
     }
+
+    /* Modalità aggiornamento BLE: niente Zigbee, niente relè (le uscite restano a riposo). */
+    if (ble_update_pending()) {
+        ble_update_run();
+    }
+
+    /* ZB2: prima dell'avvio dello stack, recupera le credenziali di un modulo aggiornato da 1.x */
+    zb2_migrate_legacy_nvram();
 
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config  = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
 
-    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+    diag_start_task();
+    maint_serial_start();
+    ble_log_start_if_enabled();
 
     /* Anti-rollback OTA */
     ota_mark_valid();

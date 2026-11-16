@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartSwitch - BLE log</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 12px 16px; color: #222; }
+  h1 { font-size: 1.2rem; margin: 0 0 8px; }
+  button { font-size: 1rem; padding: 8px 14px; margin: 4px 6px 4px 0; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-bottom: 8px; }
+  input[type=text] { font-size: 1rem; padding: 6px; width: 12em; }
+  #status { font-weight: 600; }
+  #log { background: #111; color: #ddd; padding: 8px; border-radius: 6px; height: 70vh; overflow-y: auto;
+         font-family: ui-monospace, monospace; font-size: .8rem; white-space: pre-wrap; word-break: break-all; }
+  #log div.E { color: #ff6b6b; }
+  #log div.W { color: #f5c542; }
+  #log div.sys { color: #7fb3ff; }
+  .warn { color: #b00; }
+</style>
+</head>
+<body>
+<h1>SmartSwitch - log over Bluetooth</h1>
+<p id="nobt" class="warn" style="display:none">
+  This browser does not support Web Bluetooth. Use Chrome or Edge (desktop or Android).
+</p>
+
+<div class="bar">
+  <button id="btnConn">Connect device</button>
+  <button id="btnDisc" disabled>Disconnect</button>
+  <span id="status">Not connected.</span>
+</div>
+<div class="bar">
+  <button id="btnClear">Clear</button>
+  <button id="btnSave">Save .txt</button>
+  <label><input type="checkbox" id="auto" checked> auto-scroll</label>
+  <label>filter: <input type="text" id="filter" placeholder="e.g. MAIN, SHUTTER"></label>
+  <span id="count"></span>
+</div>
+<div id="log"></div>
+
+<script>
+const SERVICE = '6a1d0010-c0de-4b1e-8b5e-5a1e7c0d0001';
+const LOGCHR  = '6a1d0011-c0de-4b1e-8b5e-5a1e7c0d0001';
+const MAX_STORED = 200000;   // lines kept in memory (for "Save")
+const MAX_SHOWN  = 4000;     // lines shown on the page
+const RETRY_MS   = 3000;
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+let device = null, wantConnected = false;
+let lines = [];              // all received lines (plain text)
+let partial = '';
+const decoder = new TextDecoder('utf-8');
+
+if (!navigator.bluetooth) { $('nobt').style.display = 'block'; $('btnConn').disabled = true; }
+
+function setStatus(t) { $('status').textContent = t; }
+
+function matchesFilter(text) {
+  const f = $('filter').value.trim();
+  if (!f) return true;
+  return f.split(',').some(s => s.trim() && text.toLowerCase().includes(s.trim().toLowerCase()));
+}
+
+function addToView(text, cls) {
+  const box = $('log');
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = text;
+  box.appendChild(d);
+  while (box.childElementCount > MAX_SHOWN) box.removeChild(box.firstChild);
+  if ($('auto').checked) box.scrollTop = box.scrollHeight;
+}
+
+function addLine(raw) {
+  const text = raw.replace(/\x1b\[[0-9;]*m/g, '');   // strips the serial ANSI colours
+  lines.push(text);
+  if (lines.length > MAX_STORED) lines.shift();
+  if (!matchesFilter(text)) return;
+  const m = /^([EWIDV]) \(/.exec(text);
+  addToView(text, m && (m[1] === 'E' || m[1] === 'W') ? m[1] : '');
+  $('count').textContent = `${lines.length} lines`;
+}
+
+function sysLine(text) {
+  const stamped = `[${new Date().toLocaleTimeString()}] ${text}`;
+  lines.push(stamped);
+  addToView(stamped, 'sys');
+}
+
+function onData(ev) {
+  const v = ev.target.value;
+  partial += decoder.decode(new Uint8Array(v.buffer, v.byteOffset, v.byteLength), { stream: true });
+  let i;
+  while ((i = partial.indexOf('\n')) >= 0) {
+    addLine(partial.slice(0, i).replace(/\r$/, ''));
+    partial = partial.slice(i + 1);
+  }
+}
+
+async function connectGatt() {
+  setStatus('Connecting…');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SERVICE);
+  const chr = await svc.getCharacteristic(LOGCHR);
+  chr.addEventListener('characteristicvaluechanged', onData);
+  await chr.startNotifications();
+  partial = '';
+  setStatus(`Connected to ${device.name}`);
+  sysLine(`Connected to ${device.name}`);
+}
+
+async function reconnectLoop() {
+  while (wantConnected && device && !device.gatt.connected) {
+    try {
+      await connectGatt();
+      return;
+    } catch (e) {
+      setStatus(`Reconnecting… (${e.message})`);
+      await sleep(RETRY_MS);
+    }
+  }
+}
+
+$('btnConn').onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'SmartLog-' }], optionalServices: [SERVICE]
+    });
+  } catch (e) {
+    setStatus(`No device chosen (${e.message})`);
+    return;
+  }
+  device.addEventListener('gattserverdisconnected', () => {
+    sysLine('Device disconnected (restart or out of range).');
+    if (wantConnected) { setStatus('Disconnected, reconnecting…'); reconnectLoop(); }
+    else setStatus('Not connected.');
+  });
+  wantConnected = true;
+  $('btnConn').disabled = true;
+  $('btnDisc').disabled = false;
+  await reconnectLoop();
+};
+
+$('btnDisc').onclick = () => {
+  wantConnected = false;
+  try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
+  $('btnConn').disabled = false;
+  $('btnDisc').disabled = true;
+  setStatus('Not connected.');
+};
+
+$('btnClear').onclick = () => { lines = []; $('log').textContent = ''; $('count').textContent = ''; };
+
+$('btnSave').onclick = () => {
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `log-smartswitch-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+};
+
+$('filter').oninput = () => {
+  $('log').textContent = '';
+  lines.slice(-MAX_SHOWN).forEach(t => {
+    if (!matchesFilter(t)) return;
+    const m = /^([EWIDV]) \(/.exec(t);
+    addToView(t, m && (m[1] === 'E' || m[1] === 'W') ? m[1] : '');
+  });
+};
+</script>
+</body>
+</html>
