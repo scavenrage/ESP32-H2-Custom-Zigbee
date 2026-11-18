@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v2.0.1]
+
+- **Fix (important):** when the coordinator stayed unreachable for 6 consecutive keepalive pings (≈ 4–5 minutes) the firmware erased the Zigbee credentials (behaviour introduced in v1.6.1 for ZBOSS state corruption). Switching off the coordinator for a few minutes (Home Assistant maintenance, faulty USB stick) therefore un-paired every powered device. Now the device enters deep sleep for 3 s and restarts **keeping the credentials**; at boot the stack retries the rejoin with the stored network data, and the cycle repeats every ≈ 5 minutes until the coordinator is back. These restarts are counted in `cs_hard_reset`. The erase after steering remains only for the invalid short address 0xFFFF
+- Not yet tested on hardware with the coordinator switched off
+
+---
+
 ## [v2.0.0]
 
 First published release after v1.6.2. It also contains the work of the unpublished development builds v1.6.3–v1.6.11 (diagnostics, BLE update, BLE log, maintenance switches), listed here together.

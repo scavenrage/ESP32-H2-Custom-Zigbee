@@ -96,9 +96,8 @@ static uint8_t s_steering_fail_count = 0;       /* fallimenti steering consecuti
  * → intervallo effettivo = 60000 × 5 = 5 minuti.
  *
  * Se il coordinator non risponde per COORDINATOR_PING_MAX_FAILS cicli
- * consecutivi (≈ 4-5 min), il dispositivo è definitivamente disconnesso
- * (tipicamente per interferenze RF) → zigbee_hard_reset(): cancella
- * credenziali (NVS "zigbee" + zb_fct) e riavvia per un join pulito.
+ * consecutivi (≈ 4-5 min) → deep sleep 3s e riavvio CON le credenziali
+ * (rejoin automatico quando il coordinator torna; vedi coordinator_ping_result).
  *
  * COORDINATOR_PING_TIMEOUT_MS: timeout di sicurezza per il caso in cui
  * la callback ZDO non venga mai chiamata (route error anziché ZDP timeout).
@@ -885,10 +884,20 @@ static void coordinator_ping_result(esp_zb_zdp_status_t zdo_status,
         led_set_state(LED_ZIGBEE_SEARCHING);
 
         if (s_ping_fail_count >= COORDINATOR_PING_MAX_FAILS) {
-            /* Disconnessione definitiva (tipicamente per interferenze RF):
-             * i retry normali non bastano. Hard reset: cancella lo storage
-             * Zigbee e riavvia per un join pulito. */
-            zigbee_hard_reset("ping fail");
+            /* Coordinator irraggiungibile da ~4-5 min. NON si cancellano le credenziali: il caso
+             * tipico è il coordinator spento (manutenzione di HA, chiavetta guasta) e cancellarle
+             * obbligherebbe a riassociare tutti i dispositivi. Si riavvia passando dal deep sleep
+             * di 3 s (reinizializza il radio come un power cycle) mantenendo le credenziali:
+             * all'avvio lo stack 2.x tenta il rejoin con i dati salvati su tutti i canali. Se il
+             * coordinator è ancora spento il ciclo si ripete ogni ~5 min finché non torna.
+             * (Fino alla v2.0.0 qui c'era zigbee_hard_reset(): eredità dei problemi di ZBOSS.)
+             * Contato in cs_hard_reset. */
+            ESP_LOGW(TAG, "Coordinator irraggiungibile da %d ping — deep sleep 3s, credenziali conservate",
+                     s_ping_fail_count);
+            diag_set_restart_cause(DIAG_CAUSE_HARD_RESET);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_sleep_enable_timer_wakeup(3ULL * 1000 * 1000);
+            esp_deep_sleep_start();
         }
 
         esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_cb,
