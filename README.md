@@ -295,3 +295,8 @@ Removed in v2.0.0: the 1.x compatibility layer of esp-zigbee-lib 2.x does not pr
 ---
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
+
+## License
+
+- Firmware, Home Assistant quirk and tools: MIT — see [LICENSE](LICENSE).
+- Hardware (`hardware/`: schematics, PCB): CERN-OHL-P-2.0 — see [hardware/LICENSE](hardware/LICENSE).
